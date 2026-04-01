@@ -1,0 +1,26 @@
+# AI & ML
+openai-whisper
+transformers
+torch
+datasets
+gymnasium
+numpy
+
+# Video & Media
+moviepy==1.0.3
+yt-dlp
+
+# Web API & Dashboard
+fastapi
+uvicorn
+jinja2
+websockets
+
+# Database & Cache
+sqlalchemy
+redis
+
+# Google API (YouTube Upload)
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
