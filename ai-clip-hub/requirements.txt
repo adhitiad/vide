@@ -1,5 +1,4 @@
 # AI & ML
-openai-whisper
 transformers
 torch
 datasets
@@ -7,7 +6,7 @@ gymnasium
 numpy
 
 # Video & Media
-moviepy==1.0.3
+moviepy
 yt-dlp
 
 # Web API & Dashboard
