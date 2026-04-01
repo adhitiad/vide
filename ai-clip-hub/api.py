@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 from data.redis_client import redis_client
+from data.database import SessionLocal
+from data.models import PublishedVideo
 from logger import logger
 
 app = FastAPI(title="AI-Clip-Hub Dashboard", version="1.0.0")
@@ -97,6 +99,9 @@ DASHBOARD_HTML = """
 
         .right-panel {
             flex: 2;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
         }
 
         h2 {
@@ -107,8 +112,8 @@ DASHBOARD_HTML = """
             margin-bottom: 15px;
         }
 
-        /* Leaderboard Styles */
-        .leaderboard {
+        /* Leaderboard & Published Table Styles */
+        .table-container {
             flex: 1;
             overflow-y: auto;
         }
@@ -133,9 +138,17 @@ DASHBOARD_HTML = """
             background-color: rgba(255, 255, 255, 0.05);
         }
 
+        a {
+            color: var(--accent-color);
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+
         /* Terminal Styles */
         .terminal {
-            flex: 1;
+            flex: 2;
             background-color: #000;
             color: #0f0;
             font-family: 'Courier New', Courier, monospace;
@@ -146,6 +159,7 @@ DASHBOARD_HTML = """
             line-height: 1.5;
             white-space: pre-wrap;
             word-wrap: break-word;
+            min-height: 300px;
         }
 
         .log-line { margin: 0; }
@@ -154,11 +168,18 @@ DASHBOARD_HTML = """
         .log-info { color: #33b5e5; }
         .log-success { color: #00C851; }
 
+        .published-panel {
+            flex: 1;
+            background-color: rgba(16, 185, 129, 0.05); /* Sedikit aksen hijau */
+            border: 1px solid var(--accent-color);
+            min-height: 200px;
+        }
+
     </style>
 </head>
 <body>
     <header>
-        <h1>🎬 AI-Clip-Hub <span style="font-size:14px; color:#94a3b8;">(Single Server Edition)</span></h1>
+        <h1>🎬 AI-Clip-Hub <span style="font-size:14px; color:#94a3b8;">(Auto-Upload Edition)</span></h1>
         <div class="status-badge" id="conn-status">🟢 Live</div>
     </header>
 
@@ -166,7 +187,7 @@ DASHBOARD_HTML = """
         <!-- Panel Kiri: Live RL Leaderboard -->
         <div class="panel left-panel">
             <h2>🏆 Live RL Leaderboard</h2>
-            <div class="leaderboard">
+            <div class="table-container">
                 <table>
                     <thead>
                         <tr>
@@ -177,18 +198,39 @@ DASHBOARD_HTML = """
                         </tr>
                     </thead>
                     <tbody id="leaderboard-body">
-                        <!-- Data will be injected here via WebSocket -->
                         <tr><td colspan="4" style="text-align:center;">Memuat data...</td></tr>
                     </tbody>
                 </table>
             </div>
         </div>
 
-        <!-- Panel Kanan: Live Cluster Terminal -->
-        <div class="panel right-panel">
-            <h2>💻 Live Cluster Terminal</h2>
-            <div class="terminal" id="terminal">
-                <!-- Logs will stream here via WebSocket -->
+        <!-- Panel Kanan: Live Cluster Terminal & Publikasi Shorts -->
+        <div class="right-panel">
+            <!-- Terminal -->
+            <div class="panel" style="flex: 2;">
+                <h2>💻 Live Cluster Terminal</h2>
+                <div class="terminal" id="terminal">
+                    <!-- Logs will stream here via WebSocket -->
+                </div>
+            </div>
+
+            <!-- Publikasi Shorts -->
+            <div class="panel published-panel" style="flex: 1;">
+                <h2 style="color: var(--accent-color);">📺 Live Publikasi (YouTube Shorts)</h2>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Waktu Publikasi</th>
+                                <th>Topik Video</th>
+                                <th>Tautan YouTube</th>
+                            </tr>
+                        </thead>
+                        <tbody id="published-body">
+                            <tr><td colspan="3" style="text-align:center;">Menunggu publikasi pertama...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
     </main>
@@ -209,8 +251,6 @@ DASHBOARD_HTML = """
 
             data.forEach((topic, index) => {
                 const tr = document.createElement('tr');
-
-                // Beri warna khusus untuk top 3
                 let rankText = index + 1;
                 if(index === 0) rankText = '🥇 ' + rankText;
                 else if(index === 1) rankText = '🥈 ' + rankText;
@@ -235,12 +275,11 @@ DASHBOARD_HTML = """
             const div = document.createElement('div');
             div.className = 'log-line';
 
-            // Simple coloring logic based on log level/keywords
-            if (msg.includes('ERROR') || msg.includes('❌')) {
+            if (msg.includes('ERROR') || msg.includes('❌') || msg.includes('GAGAL')) {
                 div.classList.add('log-error');
             } else if (msg.includes('WARNING') || msg.includes('⚠️')) {
                 div.classList.add('log-warning');
-            } else if (msg.includes('✅') || msg.includes('🏆')) {
+            } else if (msg.includes('✅') || msg.includes('🏆') || msg.includes('🎉')) {
                 div.classList.add('log-success');
             } else {
                 div.classList.add('log-info');
@@ -249,12 +288,39 @@ DASHBOARD_HTML = """
             div.textContent = msg;
             terminal.appendChild(div);
 
-            // Auto-scroll to bottom
-            // Limit terminal lines to prevent browser lag (e.g., keep last 1000 lines)
             if (terminal.childNodes.length > 500) {
                 terminal.removeChild(terminal.firstChild);
             }
             terminal.scrollTop = terminal.scrollHeight;
+        };
+
+        // --- WebSocket untuk Live Publikasi Shorts ---
+        const wsPublished = new WebSocket(`ws://${window.location.host}/ws/published`);
+        const publishedBody = document.getElementById('published-body');
+
+        wsPublished.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            publishedBody.innerHTML = '';
+
+            if (data.length === 0) {
+                publishedBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">Belum ada video yang dipublikasikan</td></tr>';
+                return;
+            }
+
+            data.forEach((vid) => {
+                const tr = document.createElement('tr');
+
+                // Format tanggal (YYYY-MM-DD HH:MM)
+                const d = new Date(vid.published_at);
+                const dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+
+                tr.innerHTML = `
+                    <td style="font-size: 13px; color: #94a3b8;">${dateStr}</td>
+                    <td><strong>${vid.topic_name}</strong></td>
+                    <td><a href="${vid.video_url}" target="_blank">🔗 Tonton di YouTube</a></td>
+                `;
+                publishedBody.appendChild(tr);
+            });
         };
 
         // Status handling
@@ -271,6 +337,7 @@ DASHBOARD_HTML = """
 
         wsStats.onclose = () => updateStatus(false);
         wsLogs.onclose = () => updateStatus(false);
+        wsPublished.onclose = () => updateStatus(false);
         wsStats.onerror = () => updateStatus(false);
 
     </script>
@@ -290,17 +357,44 @@ async def websocket_stats(websocket: WebSocket):
     logger.info("🔌 WebSocket /ws/stats terhubung.")
     try:
         while True:
-            # Ambil semua topik dari DB/Redis
             topics = redis_client.get_all_topics()
-
-            # Kirim data ke klien
             await websocket.send_text(json.dumps(topics))
-
-            # Tunggu 2 detik sebelum update selanjutnya
             await asyncio.sleep(2)
 
     except Exception as e:
-         logger.warning(f"🔌 WebSocket /ws/stats terputus: {e}")
+         logger.warning(f"🔌 WebSocket /ws/stats terputus.")
+    finally:
+         await websocket.close()
+
+@app.websocket("/ws/published")
+async def websocket_published(websocket: WebSocket):
+    """WebSocket Endpoint untuk streaming data video yang berhasil diunggah (5 terakhir)"""
+    await websocket.accept()
+    logger.info("🔌 WebSocket /ws/published terhubung.")
+    try:
+        while True:
+            session = SessionLocal()
+            try:
+                # Ambil 5 video terakhir yang diunggah
+                videos = session.query(PublishedVideo).order_by(PublishedVideo.published_at.desc()).limit(5).all()
+                result = [
+                    {
+                        "topic_name": v.topic_name,
+                        "video_url": v.video_url,
+                        "published_at": v.published_at.isoformat()
+                    } for v in videos
+                ]
+                await websocket.send_text(json.dumps(result))
+            except Exception as e:
+                logger.error(f"❌ Error query published videos: {e}")
+            finally:
+                session.close()
+
+            # Tunggu 5 detik sebelum update selanjutnya
+            await asyncio.sleep(5)
+
+    except Exception as e:
+         logger.warning(f"🔌 WebSocket /ws/published terputus.")
     finally:
          await websocket.close()
 
@@ -311,34 +405,26 @@ async def websocket_logs(websocket: WebSocket):
     logger.info("🔌 WebSocket /ws/logs terhubung.")
     log_file_path = "logs/app.log"
 
-    # Pastikan file log ada
     if not os.path.exists(log_file_path):
         open(log_file_path, 'a').close()
 
     try:
-        # Buka file log untuk dibaca
         with open(log_file_path, "r", encoding="utf-8") as f:
-            # Pindah ke akhir file, kita hanya stream log baru (seperti perintah 'tail -f')
-            # Untuk mengirim beberapa baris terakhir saat connect:
             f.seek(0, os.SEEK_END)
-            # Mundur sedikit untuk ambil context (opsional, tapi di sini kita mulai dari akhir)
 
             while True:
                 line = f.readline()
                 if not line:
-                    # Jika tidak ada baris baru, tunggu sebentar lalu cek lagi
                     await asyncio.sleep(0.5)
                     continue
 
-                # Kirim baris log ke klien
                 await websocket.send_text(line.strip())
 
     except Exception as e:
-        logger.warning(f"🔌 WebSocket /ws/logs terputus: {e}")
+        logger.warning(f"🔌 WebSocket /ws/logs terputus.")
     finally:
         await websocket.close()
 
 if __name__ == "__main__":
     import uvicorn
-    # Untuk menjalankan API secara mandiri (jika tidak via main.py)
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
