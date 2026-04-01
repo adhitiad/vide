@@ -1,0 +1,344 @@
+from fastapi import FastAPI, WebSocket, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import json
+import os
+from data.redis_client import redis_client
+from logger import logger
+
+app = FastAPI(title="AI-Clip-Hub Dashboard", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# HTML/CSS/JS Template Langsung di dalam file
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI-Clip-Hub Dashboard</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --panel-bg: #1e293b;
+            --text-color: #f8fafc;
+            --primary-color: #3b82f6;
+            --accent-color: #10b981;
+            --border-color: #334155;
+            --font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: var(--font-family);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 24px;
+            color: var(--primary-color);
+        }
+
+        .status-badge {
+            background-color: var(--accent-color);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        main {
+            display: flex;
+            flex: 1;
+            gap: 20px;
+            overflow: hidden;
+        }
+
+        .panel {
+            background-color: var(--panel-bg);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .left-panel {
+            flex: 1;
+            max-width: 400px;
+        }
+
+        .right-panel {
+            flex: 2;
+        }
+
+        h2 {
+            margin-top: 0;
+            font-size: 18px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+        }
+
+        /* Leaderboard Styles */
+        .leaderboard {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th, td {
+            padding: 10px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+
+        tr:nth-child(even) {
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        /* Terminal Styles */
+        .terminal {
+            flex: 1;
+            background-color: #000;
+            color: #0f0;
+            font-family: 'Courier New', Courier, monospace;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-y: auto;
+            font-size: 14px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .log-line { margin: 0; }
+        .log-error { color: #ff4444; }
+        .log-warning { color: #ffbb33; }
+        .log-info { color: #33b5e5; }
+        .log-success { color: #00C851; }
+
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🎬 AI-Clip-Hub <span style="font-size:14px; color:#94a3b8;">(Single Server Edition)</span></h1>
+        <div class="status-badge" id="conn-status">🟢 Live</div>
+    </header>
+
+    <main>
+        <!-- Panel Kiri: Live RL Leaderboard -->
+        <div class="panel left-panel">
+            <h2>🏆 Live RL Leaderboard</h2>
+            <div class="leaderboard">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Rank</th>
+                            <th>Topik</th>
+                            <th>Skor</th>
+                            <th>Dipilih</th>
+                        </tr>
+                    </thead>
+                    <tbody id="leaderboard-body">
+                        <!-- Data will be injected here via WebSocket -->
+                        <tr><td colspan="4" style="text-align:center;">Memuat data...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Panel Kanan: Live Cluster Terminal -->
+        <div class="panel right-panel">
+            <h2>💻 Live Cluster Terminal</h2>
+            <div class="terminal" id="terminal">
+                <!-- Logs will stream here via WebSocket -->
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // --- WebSocket untuk Stats / Leaderboard ---
+        const wsStats = new WebSocket(`ws://${window.location.host}/ws/stats`);
+        const leaderboardBody = document.getElementById('leaderboard-body');
+
+        wsStats.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            leaderboardBody.innerHTML = '';
+
+            if (data.length === 0) {
+                leaderboardBody.innerHTML = '<tr><td colspan="4" style="text-align:center;">Tidak ada topik</td></tr>';
+                return;
+            }
+
+            data.forEach((topic, index) => {
+                const tr = document.createElement('tr');
+
+                // Beri warna khusus untuk top 3
+                let rankText = index + 1;
+                if(index === 0) rankText = '🥇 ' + rankText;
+                else if(index === 1) rankText = '🥈 ' + rankText;
+                else if(index === 2) rankText = '🥉 ' + rankText;
+
+                tr.innerHTML = `
+                    <td>${rankText}</td>
+                    <td><strong>${topic.name}</strong></td>
+                    <td style="color:var(--accent-color)">${topic.score.toFixed(2)}</td>
+                    <td>${topic.times_chosen}x</td>
+                `;
+                leaderboardBody.appendChild(tr);
+            });
+        };
+
+        // --- WebSocket untuk Logs Streaming ---
+        const wsLogs = new WebSocket(`ws://${window.location.host}/ws/logs`);
+        const terminal = document.getElementById('terminal');
+
+        wsLogs.onmessage = function(event) {
+            const msg = event.data;
+            const div = document.createElement('div');
+            div.className = 'log-line';
+
+            // Simple coloring logic based on log level/keywords
+            if (msg.includes('ERROR') || msg.includes('❌')) {
+                div.classList.add('log-error');
+            } else if (msg.includes('WARNING') || msg.includes('⚠️')) {
+                div.classList.add('log-warning');
+            } else if (msg.includes('✅') || msg.includes('🏆')) {
+                div.classList.add('log-success');
+            } else {
+                div.classList.add('log-info');
+            }
+
+            div.textContent = msg;
+            terminal.appendChild(div);
+
+            // Auto-scroll to bottom
+            // Limit terminal lines to prevent browser lag (e.g., keep last 1000 lines)
+            if (terminal.childNodes.length > 500) {
+                terminal.removeChild(terminal.firstChild);
+            }
+            terminal.scrollTop = terminal.scrollHeight;
+        };
+
+        // Status handling
+        function updateStatus(isOnline) {
+             const badge = document.getElementById('conn-status');
+             if(isOnline) {
+                 badge.textContent = '🟢 Terhubung';
+                 badge.style.backgroundColor = 'var(--accent-color)';
+             } else {
+                 badge.textContent = '🔴 Terputus';
+                 badge.style.backgroundColor = '#ef4444';
+             }
+        }
+
+        wsStats.onclose = () => updateStatus(false);
+        wsLogs.onclose = () => updateStatus(false);
+        wsStats.onerror = () => updateStatus(false);
+
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def get_dashboard():
+    """Mengembalikan halaman Dashboard utama"""
+    return HTMLResponse(content=DASHBOARD_HTML, status_code=200)
+
+@app.websocket("/ws/stats")
+async def websocket_stats(websocket: WebSocket):
+    """WebSocket Endpoint untuk streaming Leaderboard setiap 2 detik"""
+    await websocket.accept()
+    logger.info("🔌 WebSocket /ws/stats terhubung.")
+    try:
+        while True:
+            # Ambil semua topik dari DB/Redis
+            topics = redis_client.get_all_topics()
+
+            # Kirim data ke klien
+            await websocket.send_text(json.dumps(topics))
+
+            # Tunggu 2 detik sebelum update selanjutnya
+            await asyncio.sleep(2)
+
+    except Exception as e:
+         logger.warning(f"🔌 WebSocket /ws/stats terputus: {e}")
+    finally:
+         await websocket.close()
+
+@app.websocket("/ws/logs")
+async def websocket_logs(websocket: WebSocket):
+    """WebSocket Endpoint untuk streaming isi file logs/app.log secara real-time"""
+    await websocket.accept()
+    logger.info("🔌 WebSocket /ws/logs terhubung.")
+    log_file_path = "logs/app.log"
+
+    # Pastikan file log ada
+    if not os.path.exists(log_file_path):
+        open(log_file_path, 'a').close()
+
+    try:
+        # Buka file log untuk dibaca
+        with open(log_file_path, "r", encoding="utf-8") as f:
+            # Pindah ke akhir file, kita hanya stream log baru (seperti perintah 'tail -f')
+            # Untuk mengirim beberapa baris terakhir saat connect:
+            f.seek(0, os.SEEK_END)
+            # Mundur sedikit untuk ambil context (opsional, tapi di sini kita mulai dari akhir)
+
+            while True:
+                line = f.readline()
+                if not line:
+                    # Jika tidak ada baris baru, tunggu sebentar lalu cek lagi
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Kirim baris log ke klien
+                await websocket.send_text(line.strip())
+
+    except Exception as e:
+        logger.warning(f"🔌 WebSocket /ws/logs terputus: {e}")
+    finally:
+        await websocket.close()
+
+if __name__ == "__main__":
+    import uvicorn
+    # Untuk menjalankan API secara mandiri (jika tidak via main.py)
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
