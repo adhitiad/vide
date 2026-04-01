@@ -16,8 +16,8 @@ def worker_process():
     # Inisialisasi Environment
     env = ContentCreatorEnv()
 
-    # Epsilon (Peluang eksplorasi topik acak)
-    epsilon = 0.20 # 20% Eksplorasi, 80% Eksploitasi
+    # Epsilon (Peluang eksplorasi topik acak/baru)
+    epsilon = 0.20 # 20% Eksplorasi Tren Baru, 80% Eksploitasi
 
     episode = 1
 
@@ -39,13 +39,16 @@ def worker_process():
 
                 # Logic Epsilon-Greedy
                 if random.random() < epsilon:
-                    # 20%: Eksplorasi (Pilih topik acak)
-                    action = env.action_space.sample()
-                    logger.info(f"🎲 [EKSPLORASI] Memilih aksi secara acak: Index {action}")
+                    # 20%: Eksplorasi (Pilih aksi terakhir untuk RISET TREN BARU)
+                    action = env.num_actions - 1
+                    logger.info(f"🎲 [EKSPLORASI] Memulai riset tren viral baru... (Action: {action})")
                 else:
-                    # 80%: Eksploitasi (Pilih topik dengan skor tertinggi saat ini)
+                    # 80%: Eksploitasi (Pilih topik dengan skor tertinggi saat ini dari DB)
                     # np.argmax(state) mencari index nilai terbesar di array numpy
-                    action = int(state.argmax())
+                    # Karena index terakhir (riset) skor fiktifnya 0.0,
+                    # argmax akan memilih topik terbaik dari daftar.
+                    best_action_idx = int(state[:-1].argmax()) if len(state) > 1 else 0
+                    action = best_action_idx
                     logger.info(f"🎯 [EKSPLOITASI] Memilih aksi terbaik: Index {action} (Skor: {state[action]:.2f})")
 
                 # Step env
@@ -77,9 +80,6 @@ if __name__ == '__main__':
     logger.info("==========================================")
     logger.info("   🤖 AI-CLIP-HUB MULAI BERJALAN 🤖   ")
     logger.info("==========================================")
-
-    # Pastikan method fork aman untuk multiprocessing, khususnya kalau pakai PyTorch dll.
-    # Namun untuk kemudahan, kita pakai default multiprocessing spawn/fork dari python
 
     p_worker = multiprocessing.Process(target=worker_process, name="WorkerProcess")
     p_api = multiprocessing.Process(target=api_process, name="APIProcess")
