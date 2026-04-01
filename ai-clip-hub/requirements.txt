@@ -1,12 +1,16 @@
 # AI & ML
+openai-whisper
 transformers
 torch
 datasets
 gymnasium
 numpy
+elevenlabs
+mediapipe
+opencv-python
 
 # Video & Media
-moviepy
+moviepy==1.0.3
 yt-dlp
 
 # Web API & Dashboard
@@ -14,12 +18,17 @@ fastapi
 uvicorn
 jinja2
 websockets
+requests
 
 # Database & Cache
 sqlalchemy
 redis
 
-# Google API (YouTube Upload)
+# Scheduling & Utilities
+apscheduler
+
+# Uploaders (YouTube & Instagram)
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
+instagrapi
