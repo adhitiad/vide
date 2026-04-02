@@ -41,6 +41,9 @@ class VideoEditor:
             # Gunakan resolusi kecil untuk tracking agar tidak lambat
             small_w, small_h = 320, int(h * (320 / w))
 
+            # Inisialisasi FaceDetection sekali di luar loop frame untuk performa
+            face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+
             def crop_frame(get_frame, t):
                 frame = get_frame(t)
 
@@ -50,15 +53,14 @@ class VideoEditor:
                 # Coba deteksi wajah setiap detik untuk optimasi
                 # Karena moviepy get_frame berjalan per frame, tracking per frame sangat lambat.
                 # Sebagai kompromi, kita pakai MediaPipe pada frame yang di-resize
-                with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
-                    small_frame = cv2.resize(frame, (small_w, small_h))
-                    results = face_detection.process(cv2.cvtColor(small_frame, cv2.COLOR_RGB2BGR))
+                small_frame = cv2.resize(frame, (small_w, small_h))
+                results = face_detection.process(cv2.cvtColor(small_frame, cv2.COLOR_RGB2BGR))
 
-                    if results.detections:
-                        # Ambil wajah pertama
-                        bbox = results.detections[0].location_data.relative_bounding_box
-                        x_center_rel = bbox.xmin + (bbox.width / 2)
-                        x_center = int(x_center_rel * w)
+                if results.detections:
+                    # Ambil wajah pertama
+                    bbox = results.detections[0].location_data.relative_bounding_box
+                    x_center_rel = bbox.xmin + (bbox.width / 2)
+                    x_center = int(x_center_rel * w)
 
                 # Batasi x_center agar tidak crop ke luar batas
                 target_ratio = target_w / target_h
@@ -80,6 +82,17 @@ class VideoEditor:
             # Demi instruksi "Face-Tracking", kita aplikasikan fl_image.
             logger.info("⏳ Melakukan Frame-by-Frame Face Tracking Crop (mungkin butuh waktu lama)...")
             tracked_clip = video_clip.fl(lambda gf, t: crop_frame(gf, t))
+
+            # Tutup FaceDetection saat clip selesai untuk membebaskan memory
+            # Karena moviepy bersifat lazy, kita pasang hook close pada clip
+            original_close = tracked_clip.close
+            def close_all():
+                try:
+                    face_detection.close()
+                finally:
+                    original_close()
+            tracked_clip.close = close_all
+
             return tracked_clip
 
         except Exception as e:
