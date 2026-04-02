@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
 import os
+import aiofiles
 from data.redis_client import redis_client
 from data.database import SessionLocal
 from data.models import PublishedVideo
@@ -333,13 +334,15 @@ async def websocket_logs(websocket: WebSocket):
     log_file_path = "logs/app.log"
 
     if not os.path.exists(log_file_path):
-        open(log_file_path, 'a').close()
+        os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+        async with aiofiles.open(log_file_path, 'a') as f:
+            pass
 
     try:
-        with open(log_file_path, "r", encoding="utf-8") as f:
-            f.seek(0, os.SEEK_END)
+        async with aiofiles.open(log_file_path, "r", encoding="utf-8") as f:
+            await f.seek(0, os.SEEK_END)
             while True:
-                line = f.readline()
+                line = await f.readline()
                 if not line:
                     await asyncio.sleep(0.5)
                     continue
