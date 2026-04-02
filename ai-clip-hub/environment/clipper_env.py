@@ -12,6 +12,7 @@ from core.knowledge import knowledge_base
 from core.researcher import get_trending_topic
 from core.uploader_yt import youtube_uploader
 from core.uploader_ig import ig_uploader
+from core.comment_generator import generate_provocative_comment
 from core.ai_models import ai_engine
 
 class ContentCreatorEnv(gym.Env):
@@ -219,8 +220,12 @@ class ContentCreatorEnv(gym.Env):
                     title = f"{selected_topic.capitalize()} | Opini UGC Viral"
                     tags = ["UGC", selected_topic.replace(" ", ""), "Viral", "Opini", "Indonesia"]
 
+
                     # 2. DISTRIBUSI: YouTube & Instagram
-                    yt_url = youtube_uploader.upload_to_youtube_shorts(output_video_path, title, description, tags, cta_text=cta_used)
+                    # Generate komentar provokatif via LangChain
+                    provocative_comment = generate_provocative_comment(description, selected_topic)
+
+                    yt_url = youtube_uploader.upload_to_youtube_shorts(output_video_path, title, description, tags, comment_text=provocative_comment)
                     if yt_url:
                         info["url_yt"] = yt_url
                         self._save_published_video(selected_topic, yt_url, "youtube")

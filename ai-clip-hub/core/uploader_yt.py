@@ -45,7 +45,7 @@ class YouTubeUploader:
             logger.error(f"❌ Autentikasi YouTube API Gagal: {e}")
             self.is_authenticated = False
 
-    def _pin_first_comment(self, video_id: str, cta_text: str):
+    def _pin_first_comment(self, video_id: str, comment_text: str):
         """Membuat komentar pertama sebagai pemancing perdebatan (UGC Hack)"""
         logger.info(f"💬 Menyematkan Komentar Pancingan ke Video {video_id}...")
         try:
@@ -54,7 +54,7 @@ class YouTubeUploader:
                     "videoId": video_id,
                     "topLevelComment": {
                         "snippet": {
-                            "textOriginal": f"Menurut AI kami: {cta_text} \\n\\nApa tanggapan logis kalian? Tuliskan opini terkuatmu di bawah! 👇"
+                            "textOriginal": comment_text
                         }
                     }
                 }
@@ -68,7 +68,7 @@ class YouTubeUploader:
         except Exception as e:
             logger.error(f"❌ Gagal menyematkan komentar YouTube: {e}")
 
-    def upload_to_youtube_shorts(self, video_path: str, title: str, description: str, tags: list = None, privacy_status: str = "public", cta_text: str = "") -> str:
+    def upload_to_youtube_shorts(self, video_path: str, title: str, description: str, tags: list = None, privacy_status: str = "public", comment_text: str = "") -> str:
         if not self.is_authenticated or not self.youtube:
             return None
 
@@ -114,8 +114,8 @@ class YouTubeUploader:
                 logger.info(f"🎉 Upload YouTube BERHASIL! {youtube_url}")
 
                 # UGC Engagement Hack: Pin Komentar
-                if cta_text:
-                    self._pin_first_comment(video_id, cta_text)
+                if comment_text:
+                    self._pin_first_comment(video_id, comment_text)
 
                 return youtube_url
             else:
