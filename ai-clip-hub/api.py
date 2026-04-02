@@ -1,6 +1,5 @@
-from fastapi import FastAPI, WebSocket, Request, BackgroundTasks
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
