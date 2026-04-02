@@ -7,6 +7,7 @@ from environment.clipper_env import ContentCreatorEnv
 from utils.dataset_prep import dataset_prep
 from scheduler_control import start_scheduler
 
+
 def worker_process():
     """
     Loop Otonom (Server ALPHA).
@@ -35,12 +36,16 @@ def worker_process():
                 logger.info(f"🔄 Menjalankan Step {step + 1} dari 10...")
                 if random.random() < epsilon:
                     action = env.num_actions - 1
-                    logger.info(f"🎲 [EKSPLORASI] Memulai riset tren viral Reddit (Aksi terakhir)...")
+                    logger.info(
+                        f"🎲 [EKSPLORASI] Memulai riset tren viral Reddit (Aksi terakhir)..."
+                    )
                 else:
                     best_action_idx = int(state[:-1].argmax()) if len(state) > 1 else 0
                     action = best_action_idx
                     topic, visual = env._decode_action(action)
-                    logger.info(f"🎯 [EKSPLOITASI] Memilih aksi terbaik: {topic} (Visual Profil: {visual}) (Skor: {state[action]:.2f})")
+                    logger.info(
+                        f"🎯 [EKSPLOITASI] Memilih aksi terbaik: {topic} (Visual Profil: {visual}) (Skor: {state[action]:.2f})"
+                    )
 
                 next_state, reward, done, truncated, step_info = env.step(action)
                 state = next_state
@@ -48,7 +53,9 @@ def worker_process():
 
                 # Jeda 2-4 jam antar siklus agar akun YT/IG aman dari ban massal
                 sleep_time = random.uniform(7200, 14400)
-                logger.info(f"⏳ Siklus selesai. Worker tidur selama {sleep_time/3600:.1f} jam...\n")
+                logger.info(
+                    f"⏳ Siklus selesai. Worker tidur selama {sleep_time/3600:.1f} jam...\n"
+                )
                 time.sleep(sleep_time)
 
             episode += 1
@@ -57,9 +64,11 @@ def worker_process():
             logger.error(f"❌ Kesalahan fatal di Worker Process: {e}")
             time.sleep(60)
 
+
 def api_process():
     logger.info("🌐 Memulai Dashboard Web (God-Tier)...")
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False, log_config=None)
+
 
 def scheduler_process():
     """Menjalankan jadwal APScheduler secara terpisah"""
@@ -71,14 +80,17 @@ def scheduler_process():
     except Exception as e:
         logger.error(f"Scheduler mati: {e}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     logger.info("==============================================")
     logger.info("   🤖 AI-CLIP-HUB (GOD-TIER UGC EDITION) 🤖   ")
     logger.info("==============================================")
 
     p_worker = multiprocessing.Process(target=worker_process, name="WorkerProcess")
     p_api = multiprocessing.Process(target=api_process, name="APIProcess")
-    p_scheduler = multiprocessing.Process(target=scheduler_process, name="SchedulerProcess")
+    p_scheduler = multiprocessing.Process(
+        target=scheduler_process, name="SchedulerProcess"
+    )
 
     p_worker.start()
     p_api.start()
