@@ -27,7 +27,7 @@ class ContentCreatorEnv(gym.Env):
 
         # 1. Action Space
         self.topics = self._get_active_topics()
-        self.visual_profiles = 3 # Editor.py memiliki 3 profil desain (0,1,2)
+        self.visual_profiles = 3 # 0: Standar Hormozi, 1: Clash of Titans, 2: Quiz Retention Trap
 
         # Action space = (Num_Topics * 3 Visuals) + 1 Aksi Riset
         # Total kombinasi unik yang bisa dieksploitasi
@@ -141,12 +141,68 @@ class ContentCreatorEnv(gym.Env):
         info = {"topic": selected_topic, "success": False, "url_yt": None, "url_ig": None}
 
         try:
-            video_path = downloader.search_and_download(selected_topic)
-            if video_path:
-                edit_result = video_editor.process_video(video_path, visual_idx)
+            edit_result = None
+            video_path = None
 
-                if edit_result:
-                    description = edit_result.get("transcript", "")
+            if visual_idx == 0:
+                # 0: Standar Hormozi
+                logger.info("🎬 Menggunakan Format 0: Standar Hormozi")
+                video_path = downloader.search_and_download(selected_topic)
+                if video_path:
+                    edit_result = video_editor.process_video(video_path, 0)
+
+            elif visual_idx == 1:
+                # 1: Clash of Titans
+                logger.info("⚔️ Menggunakan Format 1: Clash of Titans")
+                # Unduh 2 klip dengan pandangan berbeda
+                clip_pro_path = downloader.search_and_download(f"{selected_topic} pro")
+                clip_con_path = downloader.search_and_download(f"{selected_topic} kontra")
+
+                # Fallback jika tidak dapat 2 video
+                if not clip_pro_path and clip_con_path:
+                    clip_pro_path = downloader.search_and_download(selected_topic)
+                if not clip_con_path and clip_pro_path:
+                    clip_con_path = downloader.search_and_download(selected_topic)
+
+                if clip_pro_path and clip_con_path:
+                    edit_result = video_editor.create_clash_format(clip_pro_path, clip_con_path)
+                    video_path = [clip_pro_path, clip_con_path] # Untuk cleanup
+                else:
+                    logger.error("❌ Gagal mengunduh bahan untuk Clash of Titans")
+                    if clip_pro_path: downloader.cleanup(clip_pro_path)
+                    if clip_con_path: downloader.cleanup(clip_con_path)
+
+            elif visual_idx == 2:
+                # 2: Quiz Retention Trap
+                logger.info("❓ Menggunakan Format 2: Quiz Retention Trap")
+                video_path = downloader.search_and_download(selected_topic)
+                if video_path:
+                    # Transkrip sebagian untuk mDeBERTa
+                    import os, uuid
+                    import moviepy.editor as mp
+
+                    try:
+                        temp_video = mp.VideoFileClip(video_path)
+                        # Ambil 15 detik pertama untuk analisa
+                        dur = min(15, temp_video.duration)
+                        temp_clip = temp_video.subclip(0, dur)
+                        temp_audio = f"data/output/temp_audio_analyze_{uuid.uuid4().hex[:4]}.wav"
+                        temp_clip.audio.write_audiofile(temp_audio, fps=16000, nbytes=2, buffersize=2000, logger=None)
+                        words_data = ai_engine.transcribe_audio(temp_audio)
+                        transcript_text = " ".join([w["word"] for w in words_data])
+
+                        if os.path.exists(temp_audio): os.remove(temp_audio)
+                        temp_video.close()
+
+                        pertanyaan_kuis = ai_engine.generate_quiz_question(transcript_text)
+                    except Exception as e:
+                        logger.error(f"❌ Gagal mengekstrak transkrip untuk pertanyaan kuis: {e}")
+                        pertanyaan_kuis = f"Tebak apa rahasia dari {selected_topic}? Waktu kalian 5 detik..."
+
+                    edit_result = video_editor.create_quiz_format(pertanyaan_kuis, video_path)
+
+            if edit_result:
+                description = edit_result.get("transcript", "")
                     output_video_path = edit_result.get("output_path")
                     cta_used = edit_result.get("cta_used", "")
 
@@ -182,7 +238,12 @@ class ContentCreatorEnv(gym.Env):
                     if yt_url or ig_url:
                         info["success"] = True
 
-                downloader.cleanup(video_path)
+            if video_path:
+                if isinstance(video_path, list):
+                    for vp in video_path:
+                        downloader.cleanup(vp)
+                else:
+                    downloader.cleanup(video_path)
 
         except Exception as e:
             logger.error(f"❌ Kesalahan Fatal dalam Pipeline RL: {e}")

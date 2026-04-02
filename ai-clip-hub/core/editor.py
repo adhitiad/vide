@@ -150,6 +150,210 @@ class VideoEditor:
         except Exception as e:
             return []
 
+
+    def create_clash_format(self, clip_pro_path: str, clip_con_path: str) -> dict:
+        """Membuat format Clash of Titans (Split-Screen)"""
+        logger.info(f"⚔️ Memulai pembuatan format Clash of Titans...")
+        output_filename = f"clash_of_titans_{uuid.uuid4().hex[:6]}.mp4"
+        output_path = os.path.join(self.output_dir, output_filename)
+
+        try:
+            # 1. Muat Video
+            clip_pro = mp.VideoFileClip(clip_pro_path)
+            clip_con = mp.VideoFileClip(clip_con_path)
+
+            # Batasi durasi agar tidak terlalu panjang (misal 30 detik tiap klip)
+            max_dur = min(30, clip_pro.duration, clip_con.duration)
+            clip_pro = clip_pro.subclip(0, max_dur)
+            clip_con = clip_con.subclip(0, max_dur)
+
+            target_w, target_h = 1080, 960
+
+            # 2. Crop dan Resize masing-masing klip
+            clip_pro = self._autocrop_face_tracking(clip_pro, target_w, target_h)
+            clip_con = self._autocrop_face_tracking(clip_con, target_w, target_h)
+
+            # 3. Transkripsi untuk subtitle bergantian
+            temp_audio_pro = f"temp_audio_pro_{uuid.uuid4().hex[:4]}.wav"
+            temp_audio_con = f"temp_audio_con_{uuid.uuid4().hex[:4]}.wav"
+
+            clip_pro.audio.write_audiofile(temp_audio_pro, fps=16000, nbytes=2, buffersize=2000, logger=None)
+            clip_con.audio.write_audiofile(temp_audio_con, fps=16000, nbytes=2, buffersize=2000, logger=None)
+
+            words_pro = ai_engine.transcribe_audio(temp_audio_pro)
+            words_con = ai_engine.transcribe_audio(temp_audio_con)
+
+            if os.path.exists(temp_audio_pro): os.remove(temp_audio_pro)
+            if os.path.exists(temp_audio_con): os.remove(temp_audio_con)
+
+            # Buat teks subtitle untuk kedua belah pihak
+            profile = self.design_profiles[0] # Default profile
+
+            # Subtitle Pro (Atas)
+            txt_clips_pro = []
+            for w in words_pro:
+                duration = w["end"] - w["start"]
+                if duration > 0:
+                    try:
+                        t_clip = mp.TextClip(w["word"].upper(), fontsize=profile["size"], color=profile["color"], font=self.font, stroke_color=profile["stroke"], stroke_width=3, method='caption', size=(target_w - 100, None), align='center')
+                        # Posisi relatif di dalam klip atas (h=960, posisi tengah bawah)
+                        t_clip = t_clip.set_position(('center', 700)).set_start(w["start"]).set_duration(duration)
+                        txt_clips_pro.append(t_clip)
+                    except Exception: pass
+
+            # Gabungkan subtitle pro ke klip pro
+            clip_pro = mp.CompositeVideoClip([clip_pro] + txt_clips_pro)
+
+            # Karena durasi gabungan ini serentak (atas bawah bicara sama-sama?),
+            # untuk efek Clash, klip_con (Bawah) akan disesuaikan timeline-nya agar bergantian.
+            # Agar sederhana dan mengikuti instruksi:
+            # "Gabungkan secara vertikal menggunakan clips_array([[clip_pro], [clip_con]])."
+            # dan "saat atas bicara, bawah diam/di-mute, dan sebaliknya."
+            # Kita susun secara sekuensial durasinya.
+
+            # Menyusun agar bergantian:
+            # Clip Pro main duluan (durasi clip_pro), clip con di-freeze.
+            # Lalu Clip Con main (durasi clip_con), clip pro di-freeze.
+
+            pro_final_dur = clip_pro.duration
+            con_final_dur = clip_con.duration
+            total_dur = pro_final_dur + con_final_dur
+
+            # Freeze frames
+            freeze_pro = clip_pro.to_ImageClip(t=clip_pro.duration-0.1).set_duration(con_final_dur)
+            freeze_con = clip_con.to_ImageClip(t=0).set_duration(pro_final_dur)
+
+            # Urutan Pro
+            pro_part = mp.concatenate_videoclips([clip_pro, freeze_pro])
+
+            # Urutan Con: diam saat pro main, lalu main dengan subtitlenya.
+            # Subtitle Con (Bawah)
+            txt_clips_con = []
+            for w in words_con:
+                duration = w["end"] - w["start"]
+                if duration > 0:
+                    try:
+                        # Waktu start digeser karena clip_con main setelah clip_pro
+                        t_clip = mp.TextClip(w["word"].upper(), fontsize=profile["size"], color=profile["color"], font=self.font, stroke_color=profile["stroke"], stroke_width=3, method='caption', size=(target_w - 100, None), align='center')
+                        t_clip = t_clip.set_position(('center', 700)).set_start(pro_final_dur + w["start"]).set_duration(duration)
+                        txt_clips_con.append(t_clip)
+                    except Exception: pass
+
+            # Clip con delay audio dan video
+            # Freeze con di depan, clip con di belakang
+            con_part = mp.concatenate_videoclips([freeze_con, clip_con]).set_audio(
+                 mp.CompositeAudioClip([clip_con.audio.set_start(pro_final_dur)])
+            )
+            con_part = mp.CompositeVideoClip([con_part] + txt_clips_con)
+
+            # 4. Gabungkan secara vertikal menggunakan clips_array
+            final_video = mp.clips_array([[pro_part], [con_part]])
+            # Gabungkan audio dari kedua bagian
+            final_audio = mp.CompositeAudioClip([pro_part.audio, con_part.audio])
+            final_video = final_video.set_audio(final_audio)
+
+            # 5. Buat TextClip garis pemisah di tengah
+            divider_bg = mp.ColorClip(size=(target_w, 150), color=(255, 0, 0))
+            divider_bg = divider_bg.set_position(('center', 960 - 75)).set_duration(total_dur)
+
+            divider_txt = mp.TextClip("SIAPA YANG BENAR? 👇", fontsize=80, color='white', font=self.font, stroke_color='black', stroke_width=4)
+            divider_txt = divider_txt.set_position(('center', 960 - 50)).set_duration(total_dur)
+
+            # Gabungkan dengan garis pemisah
+            final_video = mp.CompositeVideoClip([final_video, divider_bg, divider_txt])
+            final_video = final_video.set_duration(total_dur)
+
+            logger.info("⚙️ Merender Mahakarya Video (Clash of Titans Edition)...")
+            final_video.write_videofile(
+                output_path, fps=30, codec='libx264', audio_codec='aac',
+                preset='ultrafast', threads=4, logger=None
+            )
+
+            clip_pro.close()
+            clip_con.close()
+            final_video.close()
+
+            # Gabungkan transcript
+            full_text = " ".join([w["word"] for w in words_pro]) + " " + " ".join([w["word"] for w in words_con])
+
+            return {
+                "output_path": output_path,
+                "transcript": full_text,
+                "cta_used": "Siapa yang paling benar menurut kalian? Komen di bawah!",
+                "duration": total_dur,
+                "design_profile": "Clash of Titans"
+            }
+        except Exception as e:
+            logger.error(f"❌ Kesalahan pada create_clash_format: {e}")
+            return None
+
+    def create_quiz_format(self, pertanyaan_kuis: str, video_utama_path: str) -> dict:
+        """Membuat Retention Trap (Quiz Format)"""
+        logger.info(f"❓ Memulai pembuatan format Retention Trap (Quiz)...")
+        output_filename = f"retention_trap_{uuid.uuid4().hex[:6]}.mp4"
+        output_path = os.path.join(self.output_dir, output_filename)
+
+        try:
+            target_w, target_h = 720, 1280
+
+            # 1. Buat intro 5 detik
+            intro_bg = mp.ColorClip(size=(target_w, target_h), color=(20, 20, 20)).set_duration(5)
+
+            # Pertanyaan
+            txt_pertanyaan = mp.TextClip(pertanyaan_kuis, fontsize=70, color='yellow', font=self.font, stroke_color='black', stroke_width=3, method='caption', size=(target_w - 60, None), align='center')
+            txt_pertanyaan = txt_pertanyaan.set_position(('center', 'center')).set_duration(5)
+
+            # Countdown
+            countdowns = []
+            for i in range(5):
+                num_txt = mp.TextClip(str(5-i), fontsize=150, color='red', font=self.font, stroke_color='white', stroke_width=5)
+                num_txt = num_txt.set_position(('center', target_h - 300)).set_start(i).set_duration(1)
+                countdowns.append(num_txt)
+
+            intro_clip = mp.CompositeVideoClip([intro_bg, txt_pertanyaan] + countdowns)
+
+            # 2. Proses video utama (seperti biasa)
+            video_utama = mp.VideoFileClip(video_utama_path)
+            max_dur = min(55, video_utama.duration)
+            video_utama = video_utama.subclip(0, max_dur)
+            video_utama = self._autocrop_face_tracking(video_utama, target_w, target_h)
+
+            temp_audio = f"temp_audio_quiz_{uuid.uuid4().hex[:4]}.wav"
+            video_utama.audio.write_audiofile(temp_audio, fps=16000, nbytes=2, buffersize=2000, logger=None)
+            words_data = ai_engine.transcribe_audio(temp_audio)
+            if os.path.exists(temp_audio): os.remove(temp_audio)
+
+            profile = self.design_profiles[1] # Pakai profil 1 misalnya
+            subtitle_clips = self._create_hormozi_subtitle(words_data, target_w, target_h, profile)
+
+            video_utama_with_subs = mp.CompositeVideoClip([video_utama] + subtitle_clips).set_duration(max_dur)
+
+            # 3. Gabungkan intro dan video utama
+            final_video = mp.concatenate_videoclips([intro_clip, video_utama_with_subs])
+
+            logger.info("⚙️ Merender Mahakarya Video (Quiz Retention Trap Edition)...")
+            final_video.write_videofile(
+                output_path, fps=30, codec='libx264', audio_codec='aac',
+                preset='ultrafast', threads=4, logger=None
+            )
+
+            video_utama.close()
+            final_video.close()
+
+            full_text = " ".join([w["word"] for w in words_data])
+
+            return {
+                "output_path": output_path,
+                "transcript": full_text,
+                "cta_used": pertanyaan_kuis,
+                "duration": final_video.duration,
+                "design_profile": "Retention Trap (Quiz)"
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Kesalahan pada create_quiz_format: {e}")
+            return None
+
     def process_video(self, input_path: str, design_profile_idx: int = 0) -> dict:
         """Memproses UGC Skala Studio (Face-Tracking, Voice-Over AI Ducking, A/B Testing Visual)"""
         logger.info(f"🎬 Memulai produksi Studio-Grade: {input_path}")
