@@ -1,5 +1,6 @@
 import os
 import pickle
+import time
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -46,27 +47,40 @@ class YouTubeUploader:
             self.is_authenticated = False
 
     def _pin_first_comment(self, video_id: str, cta_text: str):
-        """Membuat komentar pertama sebagai pemancing perdebatan (UGC Hack)"""
-        logger.info(f"💬 Menyematkan Komentar Pancingan ke Video {video_id}...")
-        try:
-            comment_body = {
-                "snippet": {
-                    "videoId": video_id,
-                    "topLevelComment": {
-                        "snippet": {
-                            "textOriginal": f"Menurut AI kami: {cta_text} \\n\\nApa tanggapan logis kalian? Tuliskan opini terkuatmu di bawah! 👇"
-                        }
+        """
+        Membuat komentar pertama sebagai pemancing perdebatan (UGC Hack).
+        Catatan: YouTube Data API v3 tidak mendukung penyematan (pin) komentar secara langsung.
+        Metode ini hanya memposting komentar pertama untuk mendorong interaksi.
+        """
+        logger.info(f"💬 Memposting Komentar Pancingan ke Video {video_id}...")
+
+        comment_body = {
+            "snippet": {
+                "videoId": video_id,
+                "topLevelComment": {
+                    "snippet": {
+                        "textOriginal": f"Menurut AI kami: {cta_text}\n\nApa tanggapan logis kalian? Tuliskan opini terkuatmu di bawah! 👇"
                     }
                 }
             }
-            response = self.youtube.commentThreads().insert(
-                part="snippet",
-                body=comment_body
-            ).execute()
+        }
 
-            logger.info("📌 Komentar Pancingan Berhasil Di-Pin!")
-        except Exception as e:
-            logger.error(f"❌ Gagal menyematkan komentar YouTube: {e}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.youtube.commentThreads().insert(
+                    part="snippet",
+                    body=comment_body
+                ).execute()
+                logger.info("✅ Komentar Pancingan Berhasil Diposting!")
+                return
+            except Exception as e:
+                wait_time = 2 ** (attempt + 1)
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Gagal memposting komentar (Percobaan {attempt + 1}/{max_retries}). Mencoba lagi dalam {wait_time} detik... Error: {e}")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ Gagal memposting komentar YouTube setelah {max_retries} percobaan: {e}")
 
     def upload_to_youtube_shorts(self, video_path: str, title: str, description: str, tags: list = None, privacy_status: str = "public", cta_text: str = "") -> str:
         if not self.is_authenticated or not self.youtube:
