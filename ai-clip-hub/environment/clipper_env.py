@@ -1,7 +1,6 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import random
 from logger import logger
 from data.redis_client import redis_client
 from data.database import SessionLocal
