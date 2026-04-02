@@ -1,7 +1,7 @@
 import redis
 import json
 from logger import logger
-import os
+
 from .database import SessionLocal
 from .models import TopicMemory
 import time
