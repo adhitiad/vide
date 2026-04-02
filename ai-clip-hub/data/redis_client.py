@@ -85,6 +85,54 @@ class RedisManager:
         finally:
             session.close()
 
+
+    def get_topic_scores_batch(self, topic_names: list[str]) -> dict:
+        """Mengambil skor topik secara batch (Prioritas: Redis -> SQLite)"""
+        if not topic_names:
+            return {}
+
+        results = {}
+        missing_topics = set(topic_names)
+
+        # 1. Coba ambil dari Redis via mget jika aktif
+        if self._use_redis:
+            try:
+                keys = [f"topic:{name}" for name in topic_names]
+                redis_data = self._client.mget(keys)
+
+                for topic, data_str in zip(topic_names, redis_data):
+                    if data_str:
+                        try:
+                            results[topic] = json.loads(data_str)
+                            missing_topics.discard(topic)
+                        except json.JSONDecodeError:
+                            pass
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal mget dari Redis: {e}. Fallback SQLite penuh.")
+
+        # 2. Ambil sisanya dari SQLite via IN clause
+        if missing_topics:
+            session = SessionLocal()
+            try:
+                # Query menggunakan in_
+                db_topics = session.query(TopicMemory).filter(TopicMemory.name.in_(missing_topics)).all()
+                for topic in db_topics:
+                    results[topic.name] = {
+                        "score": topic.score,
+                        "times_chosen": topic.times_chosen
+                    }
+                    missing_topics.discard(topic.name)
+            except Exception as e:
+                logger.error(f"❌ Gagal membaca batch SQLite: {e}")
+            finally:
+                session.close()
+
+        # 3. Nilai default untuk topik yang benar-benar tidak ada
+        for topic in missing_topics:
+            results[topic] = {"score": 0.0, "times_chosen": 0}
+
+        return results
+
     def get_all_topics(self):
         """Mendapatkan semua topik dari SQLite untuk Leaderboard"""
         session = SessionLocal()

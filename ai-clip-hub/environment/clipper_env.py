@@ -57,8 +57,10 @@ class ContentCreatorEnv(gym.Env):
     def _update_state(self):
         self.state = np.zeros(self.num_actions)
 
+        scores_data = redis_client.get_topic_scores_batch(self.topics)
+
         for i, topic in enumerate(self.topics):
-            data = redis_client.get_topic_score(topic)
+            data = scores_data.get(topic, {})
             base_score = data.get("score", 0.0)
 
             # Kita bagi base_score secara seragam ke tiap variasi visual (sebagai simplifikasi)
@@ -203,43 +205,43 @@ class ContentCreatorEnv(gym.Env):
 
             if edit_result:
                 description = edit_result.get("transcript", "")
-                    output_video_path = edit_result.get("output_path")
-                    cta_used = edit_result.get("cta_used", "")
+                output_video_path = edit_result.get("output_path")
+                cta_used = edit_result.get("cta_used", "")
 
-                    # 1. EVALUASI SENTIMEN IndoBERT (Simulasi UGC Reward)
-                    # Kita asumsikan transcript/CTA memancing sentimen audiens.
-                    # Jika kalimat memancing debat/reaksi kuat, reward bertambah.
-                    sentiment_score = ai_engine.evaluate_sentiment([cta_used, description[:200]])
-                    # Base reward + Sentiment Evaluation (-1.5 s/d +2.0)
-                    reward = 1.0 + sentiment_score
-                    logger.info(f"📊 Evaluasi Sentimen UGC selesai. Reward Akhir: {reward:.2f}")
+                # 1. EVALUASI SENTIMEN IndoBERT (Simulasi UGC Reward)
+                # Kita asumsikan transcript/CTA memancing sentimen audiens.
+                # Jika kalimat memancing debat/reaksi kuat, reward bertambah.
+                sentiment_score = ai_engine.evaluate_sentiment([cta_used, description[:200]])
+                # Base reward + Sentiment Evaluation (-1.5 s/d +2.0)
+                reward = 1.0 + sentiment_score
+                logger.info(f"📊 Evaluasi Sentimen UGC selesai. Reward Akhir: {reward:.2f}")
 
-                    knowledge_base.extract_and_save(selected_topic, edit_result, reward=reward)
+                knowledge_base.extract_and_save(selected_topic, edit_result, reward=reward)
 
-                    title = f"{selected_topic.capitalize()} | Opini UGC Viral"
-                    tags = ["UGC", selected_topic.replace(" ", ""), "Viral", "Opini", "Indonesia"]
+                title = f"{selected_topic.capitalize()} | Opini UGC Viral"
+                tags = ["UGC", selected_topic.replace(" ", ""), "Viral", "Opini", "Indonesia"]
 
 
-                    # 2. DISTRIBUSI: YouTube & Instagram
-                    # Generate komentar provokatif via LangChain
-                    provocative_comment = generate_provocative_comment(description, selected_topic)
+                # 2. DISTRIBUSI: YouTube & Instagram
+                # Generate komentar provokatif via LangChain
+                provocative_comment = generate_provocative_comment(description, selected_topic)
 
-                    yt_url = youtube_uploader.upload_to_youtube_shorts(output_video_path, title, description, tags, comment_text=provocative_comment)
-                    if yt_url:
-                        info["url_yt"] = yt_url
-                        self._save_published_video(selected_topic, yt_url, "youtube")
-                    else:
-                        reward -= 1.0 # Penalti karena gagal YT
+                yt_url = youtube_uploader.upload_to_youtube_shorts(output_video_path, title, description, tags, comment_text=provocative_comment)
+                if yt_url:
+                    info["url_yt"] = yt_url
+                    self._save_published_video(selected_topic, yt_url, "youtube")
+                else:
+                    reward -= 1.0 # Penalti karena gagal YT
 
-                    ig_caption = f"{title}\\n\\n{cta_used}\\n\\n#reelsindonesia #viral"
-                    ig_url = ig_uploader.upload_to_reels(output_video_path, ig_caption)
-                    if ig_url:
-                        info["url_ig"] = ig_url
-                        self._save_published_video(selected_topic, ig_url, "instagram")
-                    else:
-                        pass # IG sering strict, jangan hukum agen terlalu berat
+                ig_caption = f"{title}\\n\\n{cta_used}\\n\\n#reelsindonesia #viral"
+                ig_url = ig_uploader.upload_to_reels(output_video_path, ig_caption)
+                if ig_url:
+                    info["url_ig"] = ig_url
+                    self._save_published_video(selected_topic, ig_url, "instagram")
+                else:
+                    pass # IG sering strict, jangan hukum agen terlalu berat
 
-                    if yt_url or ig_url:
+                if yt_url or ig_url:
                         info["success"] = True
 
             if video_path:

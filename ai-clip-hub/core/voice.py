@@ -1,7 +1,7 @@
 import os
 import uuid
 from logger import logger
-from elevenlabs import Voice, VoiceSettings, generate, save
+from elevenlabs.client import ElevenLabs
 
 # ==============================================================================
 # ⚠️ PENTING UNTUK USER ⚠️
