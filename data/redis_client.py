@@ -2,8 +2,8 @@ import redis
 import json
 from logger import logger
 
-from database import SessionLocal
-from models import TopicMemory
+from .database import SessionLocal
+from .models import TopicMemory
 import time
 
 
