@@ -93,6 +93,38 @@ class AIEngine:
             logger.error(f"❌ Smart CTA gagal: {e}")
             return "Drop komentar kalian di bawah!"
 
+
+    def generate_quiz_question(self, transcript_text: str):
+        if not self.mdeberta_pipeline:
+            logger.warning("⚠️ mDeBERTa tidak tersedia. Menggunakan kuis default.")
+            return "Tebak apa rahasia mengejutkan ini? Waktu kalian 5 detik..."
+
+        if not transcript_text or len(transcript_text.strip()) < 10:
+             return "Tebak apa rahasia ini? Waktu kalian 5 detik..."
+
+        logger.info("🧠 Menganalisis teks untuk Pertanyaan Kuis...")
+        # Simplifikasi logika "ekstrak inti jawaban" menjadi memicu rasa penasaran
+        candidate_labels = ["mengungkap fakta", "strategi rahasia", "kesalahan fatal", "tips sukses"]
+
+        try:
+            text_to_analyze = transcript_text[:1000] # Analisis dari awal
+            result = self.mdeberta_pipeline(text_to_analyze, candidate_labels)
+            top_label = result['labels'][0]
+
+            kuis_mapping = {
+                "mengungkap fakta": "Tebak apa fakta mengejutkan dari opini ini? Waktu kalian 5 detik...",
+                "strategi rahasia": "Tebak apa strategi rahasia orang ini? Waktu kalian 5 detik...",
+                "kesalahan fatal": "Tebak apa kesalahan fatal yang dia bahas? Waktu kalian 5 detik...",
+                "tips sukses": "Tebak apa tips sukses utama di video ini? Waktu kalian 5 detik..."
+            }
+
+            kuis_text = kuis_mapping.get(top_label, "Tebak apa inti rahasia dari video ini? Waktu kalian 5 detik...")
+            logger.info(f"✅ Pertanyaan Kuis dihasilkan: '{kuis_text}' (Kategori: {top_label})")
+            return kuis_text
+        except Exception as e:
+            logger.error(f"❌ Generate Pertanyaan Kuis gagal: {e}")
+            return "Tebak apa hal penting yang dibahas ini? Waktu kalian 5 detik..."
+
     def evaluate_sentiment(self, texts: list):
         """Mengevaluasi sentimen teks UGC (misal simulasi komentar) menggunakan IndoBERT"""
         if not self.indobert_pipeline:
