@@ -5,7 +5,7 @@ import random
 from logger import logger
 from data.redis_client import redis_client
 from data.database import SessionLocal
-from data.models import PublishedVideo, TopicMemory
+from data.models import PublishedVideo
 from core.downloader import downloader
 from core.editor import video_editor
 from core.knowledge import knowledge_base
