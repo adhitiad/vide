@@ -1,4 +1,5 @@
 import multiprocessing
+from dotenv import load_dotenv
 import time
 import uvicorn
 import random
@@ -6,6 +7,9 @@ from logger import logger
 from environment.clipper_env import ContentCreatorEnv
 from utils.dataset_prep import dataset_prep
 from scheduler_control import start_scheduler
+
+
+load_dotenv()
 
 
 def worker_process():

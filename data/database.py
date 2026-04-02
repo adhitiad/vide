@@ -1,7 +1,7 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
-from .models import Base
+from data.models import Base
 from logger import logger
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_memory.db")

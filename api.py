@@ -1,4 +1,5 @@
 from fastapi import FastAPI, WebSocket, Request
+from dotenv import load_dotenv
 from fastapi.responses import HTMLResponse
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,7 @@ from data.database import SessionLocal
 from data.models import PublishedVideo
 from logger import logger
 
+load_dotenv()
 app = FastAPI(title="AI-Clip-Hub Dashboard (God-Tier Edition)", version="2.0.0")
 
 app.add_middleware(
@@ -282,9 +284,11 @@ DASHBOARD_HTML = """
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML, status_code=200)
+
 
 @app.websocket("/ws/stats")
 async def websocket_stats(websocket: WebSocket):
@@ -296,9 +300,10 @@ async def websocket_stats(websocket: WebSocket):
             await websocket.send_text(json.dumps(topics))
             await asyncio.sleep(2)
     except Exception as e:
-         pass
+        pass
     finally:
-         await websocket.close()
+        await websocket.close()
+
 
 @app.websocket("/ws/published")
 async def websocket_published(websocket: WebSocket):
@@ -308,23 +313,30 @@ async def websocket_published(websocket: WebSocket):
         while True:
             session = SessionLocal()
             try:
-                videos = session.query(PublishedVideo).order_by(PublishedVideo.published_at.desc()).limit(8).all()
+                videos = (
+                    session.query(PublishedVideo)
+                    .order_by(PublishedVideo.published_at.desc())
+                    .limit(8)
+                    .all()
+                )
                 result = [
                     {
                         "platform": v.platform,
                         "topic_name": v.topic_name,
                         "video_url": v.video_url,
-                        "published_at": v.published_at.isoformat()
-                    } for v in videos
+                        "published_at": v.published_at.isoformat(),
+                    }
+                    for v in videos
                 ]
                 await websocket.send_text(json.dumps(result))
             finally:
                 session.close()
             await asyncio.sleep(5)
     except Exception as e:
-         pass
+        pass
     finally:
-         await websocket.close()
+        await websocket.close()
+
 
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket):
@@ -333,7 +345,7 @@ async def websocket_logs(websocket: WebSocket):
     log_file_path = "logs/app.log"
 
     if not os.path.exists(log_file_path):
-        open(log_file_path, 'a').close()
+        open(log_file_path, "a").close()
 
     try:
         with open(log_file_path, "r", encoding="utf-8") as f:
@@ -349,6 +361,8 @@ async def websocket_logs(websocket: WebSocket):
     finally:
         await websocket.close()
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
