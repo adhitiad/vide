@@ -15,17 +15,15 @@ from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from logger import logger
-from data.database import SessionLocal
-from data.models import TopicMemory
+from data.mongodb_client import db
 from pydantic import SecretStr
 
 
 def get_fallback_comment(topic: str, is_aggressive: bool = False) -> str:
     """Komentar cadangan dari template lokal jika LLM tidak tersedia."""
-    session = SessionLocal()
     try:
-        topic_data = session.query(TopicMemory).filter(TopicMemory.name == topic).first()
-        topic_name = topic_data.name if topic_data else topic
+        topic_data = db["topics"].find_one({"name": topic})
+        topic_name = topic_data.get("name", topic) if topic_data else topic
 
         if is_aggressive:
             # Template agresif: langsung menyerang, memancing emosi kuat
@@ -54,10 +52,8 @@ def get_fallback_comment(topic: str, is_aggressive: bool = False) -> str:
         return random.choice(fallbacks)
 
     except Exception as e:
-        logger.error(f"❌ Gagal mengambil fallback dari database: {e}")
+        logger.error(f"❌ Gagal mengambil fallback dari MongoDB: {e}")
         return f"Gimana pendapat kalian soal {topic}? Komen di bawah ya! 👇"
-    finally:
-        session.close()
 
 
 def generate_provocative_comment(

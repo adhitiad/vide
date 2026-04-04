@@ -3,12 +3,15 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import time
 import random
+import datetime
+import pytz
 from logger import logger
 from environment.clipper_env import ContentCreatorEnv
 from utils.dataset_prep import dataset_prep
+from data.mongodb_client import db
+from data.models import UploadQueue, PublishedVideo
+from core.uploader_manager import uploader_manager
 from core.analytics_tracker import run_all_trackers
-import pytz
-
 
 def execute_scheduled_task(job_name: str, epsilon: float = 0.2):
     """Fungsi pembungkus untuk menjalankan agen RL di waktu tertentu"""
@@ -34,90 +37,142 @@ def execute_scheduled_task(job_name: str, epsilon: float = 0.2):
     logger.info(f"✅ Jadwal {job_name} Selesai. (Reward: {reward:.2f})")
 
 
-def retry_failed_uploads():
+def process_upload_queue():
     """
-    Coba ulang video yang gagal di-upload kemarin (status 'failed' di DB).
-    Dipanggil setiap hari jam 14:30 WIB (setelah kuota API YouTube di-reset).
+    Worker yang mengecek antrean upload secara berkala.
+    Mendukung strategi 'Staggered Upload' (berjeda) antar platform.
     """
-    from data.database import SessionLocal
-    from data.models import UploadQueue
-    from core.uploader_yt import youtube_uploader
-    import datetime
-
-    logger.info("🔄 [RETRY JOB] Mengecek video yang gagal untuk di-retry...")
-    session = SessionLocal()
+    logger.info("📡 [QUEUE WORKER] Mengecek antrean upload terjadwal...")
     try:
-        # Ambil video yang statusnya 'failed' dari hari sebelumnya
-        failed_videos = (
-            session.query(UploadQueue)
-            .filter(UploadQueue.status == "failed")
-            .order_by(UploadQueue.created_at.asc())
-            .limit(3)  # Maksimal 3 retry sekaligus agar tidak membanjiri kuota baru
-            .all()
-        )
+        now = datetime.datetime.utcnow()
+        # Ambil tugas yang sudah tiba waktunya (MongoDB query)
+        pending_tasks_data = db.upload_queue.find({
+            "status": "pending",
+            "scheduled_at": {"$lte": now}
+        }).sort("scheduled_at", 1)
 
-        if not failed_videos:
-            logger.info("✅ [RETRY JOB] Tidak ada video gagal. Kuota bersih!")
+        pending_tasks = [UploadQueue.from_dict(t) for t in pending_tasks_data]
+
+        if not pending_tasks:
             return
 
-        logger.info(
-            f"⚠️ [RETRY JOB] Ditemukan {len(failed_videos)} video gagal. Mencoba kembali..."
-        )
+        logger.info(f"📋 [QUEUE WORKER] Ditemukan {len(pending_tasks)} tugas siap eksekusi.")
 
-        for video in failed_videos:
-            logger.info(
-                f"📤 [RETRY] Mencoba upload ulang: '{video.title}' ({video.video_path})"
-            )
-            video.status = "retrying"
-            session.commit()
+        for task in pending_tasks:
+            platform = str(task.platform).lower()
+            logger.info(f"📤 [QUEUE] Memproses {platform} untuk: {task.title}")
+            
+            # Update status di MongoDB
+            db.upload_queue.update_one({"_id": task._id}, {"$set": {"status": "uploading"}})
 
-            yt_url = youtube_uploader.upload_to_youtube_shorts(
-                video_path=video.video_path,
-                title=video.title,
-                description=video.description,
-                tags=video.tags.split(",") if video.tags else [],
-            )
+            success_url = None
+            platform_video_id = None
 
-            if yt_url:
-                video.status = "published"
-                video.published_url = yt_url
-                video.published_at = datetime.datetime.utcnow()
-                logger.info(f"🎉 [RETRY] Berhasil! {yt_url}")
-            else:
-                video.status = "failed"
-                video.retry_count = (video.retry_count or 0) + 1
-                logger.error(
-                    f"❌ [RETRY] Masih gagal setelah retry ke-{video.retry_count}."
+            try:
+                # Menggunakan casting str() untuk menghindari peringatan Pyright
+                v_path = str(task.video_path)
+                v_title = str(task.title)
+                v_desc = str(task.description)
+                v_tags = str(task.tags).split(",") if task.tags else []
+
+                # Gunakan UploaderManager (Unified Interface)
+                success_url = uploader_manager.upload_video(
+                    platform=platform,
+                    video_path=v_path,
+                    title=v_title,
+                    description=v_desc
                 )
 
-            session.commit()
+                if success_url:
+                    # Ekstrak ID video jika memungkinkan (utamanya untuk YouTube/Instagram)
+                    if platform == "youtube" and "/shorts/" in success_url:
+                         platform_video_id = success_url.split("/shorts/")[-1].split("?")[0].strip()
+                    elif platform == "instagram" and "/reels/" in success_url:
+                         platform_video_id = success_url.split("/reels/")[-1].strip("/")
+
+                if success_url:
+                    # Update sukses di MongoDB
+                    db.upload_queue.update_one({"_id": task._id}, {
+                        "$set": {
+                            "status": "published",
+                            "published_url": success_url,
+                            "published_at": datetime.datetime.utcnow()
+                        }
+                    })
+                    
+                    # Simpan ke track record analytics MongoDB
+                    new_pub = PublishedVideo(
+                        topic_name=task.topic_name,
+                        platform=platform,
+                        video_url=success_url,
+                        platform_video_id=platform_video_id,
+                        performance_status="PENDING"
+                    )
+                    db.published_videos.insert_one(new_pub.to_dict())
+                    logger.info(f"🎉 [QUEUE] {platform} BERHASIL dipublish!")
+                else:
+                    db.upload_queue.update_one({"_id": task._id}, {
+                        "$set": {
+                            "status": "failed",
+                            "last_error": "Uploader returned None/False"
+                        }
+                    })
+                    logger.error(f"❌ [QUEUE] {platform} GAGAL.")
+
+            except Exception as inner_e:
+                db.upload_queue.update_one({"_id": task._id}, {
+                    "$set": {
+                        "status": "failed",
+                        "last_error": str(inner_e)
+                    }
+                })
+                logger.error(f"❌ [QUEUE] Fatal error pada {platform}: {inner_e}")
 
     except Exception as e:
-        logger.error(f"❌ [RETRY JOB] Error saat retry: {e}")
-        session.rollback()
-    finally:
-        session.close()
+        logger.error(f"❌ [QUEUE WORKER] Error sistem: {e}")
+
+
+def retry_failed_uploads():
+    """
+    Coba ulang video yang gagal di-upload (status 'failed' di DB).
+    Biasanya dipanggil setelah kuota API reset.
+    """
+    logger.info("🔄 [RETRY JOB] Mengecek video yang gagal untuk di-retry...")
+    try:
+        failed_tasks_data = db.upload_queue.find({
+            "status": "failed",
+            "retry_count": {"$lt": 3}  # Hardcoded max_retries atau ambil dari model
+        }).sort("created_at", 1).limit(5)
+
+        failed_tasks = [UploadQueue.from_dict(t) for t in failed_tasks_data]
+
+        if not failed_tasks:
+            logger.info("✅ [RETRY JOB] Tidak ada video gagal yang perlu di-retry.")
+            return
+
+        for task in failed_tasks:
+            logger.info(f"📤 [RETRY] Mengembalikan status {task.platform} ke 'pending' untuk diproses ulang.")
+            
+            db.upload_queue.update_one({"_id": task._id}, {
+                "$set": {
+                    "status": "pending",
+                    "retry_count": (task.retry_count or 0) + 1,
+                    "scheduled_at": datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
+                }
+            })
+            
+    except Exception as e:
+        logger.error(f"❌ [RETRY JOB] Error: {e}")
 
 
 def start_scheduler():
     """
     Inisialisasi APScheduler dengan strategi 'Prime Time Upload'.
-
-    STRATEGI MINGGU 1-2 (Anti-Spam Algorithm):
-    - AI memproduksi video secara internal (queue mode) setiap 4 jam sekali.
-    - Upload ke YouTube HANYA 2x sehari di prime time: Jam 12:00 & 19:00 WIB.
-    - Konsistensi > Kuantitas Brutal. Algoritma YouTube menghargai ritme yang stabil.
-    - Retry video gagal setiap jam 14:30 WIB (setelah kuota API di-reset tengah malam Pasifik).
     """
-    # Menggunakan zona waktu Indonesia (WIB)
     tz = pytz.timezone("Asia/Jakarta")
     scheduler = BackgroundScheduler(timezone=tz)
 
-    # =========================================================
-    # JOB 1: Produksi Video (Setiap 4 Jam) - TETAP BERJALAN
-    # AI mengedit video dan menyimpan ke antrian lokal,
-    # TAPI TIDAK langsung upload. Upload dilakukan oleh Job 2.
-    # =========================================================
+    # Produksi Video (Setiap 4 Jam)
     scheduler.add_job(
         execute_scheduled_task,
         trigger=IntervalTrigger(hours=4),
@@ -126,35 +181,25 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # =========================================================
-    # JOB 2: Upload Prime Time SIANG - Jam 12:00 WIB
-    # Maksimal 1 video yang paling kuat diunggah saat makan siang.
-    # =========================================================
+    # Upload Prime Time Siang
     scheduler.add_job(
         execute_scheduled_task,
         trigger=CronTrigger(hour=12, minute=0, timezone=tz),
-        args=["Upload Prime Time Siang (12:00 WIB)", 0.1],  # Epsilon rendah = Eksploitasi
+        args=["Upload Prime Time Siang (12:00 WIB)", 0.1],
         id="upload_prime_siang",
         replace_existing=True,
     )
 
-    # =========================================================
-    # JOB 3: Upload Prime Time MALAM - Jam 19:00 WIB
-    # Slot prime time terkuat. Penonton aktif setelah pulang kerja/sekolah.
-    # =========================================================
+    # Upload Prime Time Malam
     scheduler.add_job(
         execute_scheduled_task,
         trigger=CronTrigger(hour=19, minute=0, timezone=tz),
-        args=["Upload Prime Time Malam (19:00 WIB)", 0.1],  # Epsilon rendah = Eksploitasi
+        args=["Upload Prime Time Malam (19:00 WIB)", 0.1],
         id="upload_prime_malam",
         replace_existing=True,
     )
 
-    # =========================================================
-    # JOB 4: Retry Video Gagal - Jam 14:30 WIB
-    # YouTube API quota reset tengah malam waktu Pasifik (~14:00-15:00 WIB).
-    # Kita tunggu 30 menit ekstra agar reset pasti selesai.
-    # =========================================================
+    # Retry Video Gagal (Setiap hari jam 14:30 WIB)
     scheduler.add_job(
         retry_failed_uploads,
         trigger=CronTrigger(hour=14, minute=30, timezone=tz),
@@ -162,14 +207,7 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # =========================================================
-    # JOB 5: Auto-Analytics Tracker - Jam 23:30 WIB
-    # Tarik stats (views/likes/comments) dari YouTube & Instagram API.
-    # Update performance_status di DB:
-    #   - GOOD      → views >= 100 setelah 24 jam
-    #   - LOW_VIEWS → views < 100 setelah 24 jam (memicu Self-Correction besok)
-    #   - VIRAL     → views >= 1000 (topik mendapat bonus score di Redis)
-    # =========================================================
+    # Auto-Analytics Tracker (Setiap hari jam 23:30 WIB)
     scheduler.add_job(
         run_all_trackers,
         trigger=CronTrigger(hour=23, minute=30, timezone=tz),
@@ -177,16 +215,16 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    scheduler.start()
-    logger.info(
-        "📅 APScheduler berhasil diaktifkan.\n"
-        "   🎬 Produksi      : Setiap 4 jam (AI terus produksi, simpan ke queue)\n"
-        "   📤 Upload        : Prime Time Siang 12:00 WIB & Malam 19:00 WIB (2 video/hari)\n"
-        "   🔄 Retry Gagal   : Setiap hari jam 14:30 WIB (setelah quota API reset)\n"
-        "   📊 Analytics     : Setiap hari jam 23:30 WIB (update views/likes + evaluasi status)\n"
-        "   🔥 Self-Correct  : Aktif otomatis jika ditemukan video LOW_VIEWS saat step() berikutnya\n"
-        "   ✅ Strategi      : Konsistensi > Kuantitas - Anti Spam Algorithm"
+    # Queue Worker (Setiap 10 Menit)
+    scheduler.add_job(
+        process_upload_queue,
+        trigger=IntervalTrigger(minutes=10),
+        id="process_upload_queue",
+        replace_existing=True,
     )
+
+    scheduler.start()
+    logger.info("📅 APScheduler berhasil diaktifkan dengan Queue System (YT, IG, FB, TT).")
     return scheduler
 
 

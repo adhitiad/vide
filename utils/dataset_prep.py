@@ -22,11 +22,15 @@ class DatasetPreparer:
         try:
             with open(self.jsonl_output, "w", encoding="utf-8") as outfile:
                 for f_path in json_files:
-                    with open(f_path, "r", encoding="utf-8") as infile:
-                        data = json.load(infile)
-                        # Tulis sebagai satu baris JSON
-                        json.dump(data, outfile, ensure_ascii=False)
-                        outfile.write("\n")
+                    try:
+                        with open(f_path, "r", encoding="utf-8") as infile:
+                            data = json.load(infile)
+                            # Tulis sebagai satu baris JSON
+                            json.dump(data, outfile, ensure_ascii=False)
+                            outfile.write("\n")
+                    except Exception as parse_err:
+                        logger.error(f"⚠️ Melewati file rusak {f_path}: {parse_err}")
+                        continue
 
             logger.info(f"✅ Berhasil menggabungkan {len(json_files)} file menjadi {self.jsonl_output}")
             return True

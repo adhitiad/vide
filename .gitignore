@@ -8,6 +8,7 @@ venv/
 env/
 ENV/
 data/ytUpload/
+tmp/
 
 # Distribution / packaging
 build/
@@ -50,5 +51,7 @@ client_secret*.json
 # Project Specific
 data/output/
 modulTrain/
+data/tt_session/
+data/fb_session/
 temp_audio_analyze_*.wav
 token.pickle

@@ -1,12 +1,11 @@
 import redis
 import json
 import os
+import time
 from dotenv import load_dotenv
 from logger import logger
 
-from data.database import SessionLocal
-from data.models import TopicMemory
-import time
+from data.mongodb_client import db
 
 load_dotenv()
 
@@ -38,40 +37,34 @@ class RedisManager:
             self._client.ping()
             self._use_redis = True
             logger.info("🟢 Redis terhubung! Memori cache aktif.")
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
+        except (redis.ConnectionError, redis.TimeoutError):
             self._use_redis = False
             logger.warning(
-                "🔴 Redis tidak ditemukan/mati. Fallback otomatis menggunakan SQLite!"
+                "🔴 Redis tidak ditemukan/mati. Fallback otomatis menggunakan MongoDB!"
             )
 
     def set_topic_score(self, topic_name: str, score: float, times_chosen: int = None):
-        """Menyimpan atau mengupdate skor topik (Redis -> SQLite)"""
-        # 1. Update ke SQLite (sebagai persistent storage)
-        session = SessionLocal()
+        """Menyimpan atau mengupdate skor topik (Redis -> MongoDB)"""
+        # 1. Update ke MongoDB
         try:
-            topic = (
-                session.query(TopicMemory)
-                .filter(TopicMemory.name == topic_name)
-                .first()
+            update_data = {"score": score}
+            if times_chosen is not None:
+                update_data["times_chosen"] = times_chosen
+            
+            # Gunakan ops tunggal untuk menghindari konflik $set/$setOnInsert pada field yang sama
+            db.topic_memory.update_one(
+                {"name": topic_name},
+                {
+                    "$set": update_data,
+                    "$setOnInsert": {"created_at": int(time.time())}
+                },
+                upsert=True
             )
-            if topic:
-                topic.score = score
-                if times_chosen is not None:
-                    topic.times_chosen = times_chosen
-            else:
-                topic = TopicMemory(
-                    name=topic_name, score=score, times_chosen=times_chosen or 1
-                )
-                session.add(topic)
-            session.commit()
         except Exception as e:
-            session.rollback()
-            logger.error(f"❌ Gagal update SQLite untuk topik '{topic_name}': {e}")
-        finally:
-            session.close()
+            logger.error(f"❌ Gagal update MongoDB untuk topik '{topic_name}': {e}")
 
         # 2. Update ke Redis (jika aktif)
-        if self._use_redis:
+        if self._use_redis and self._client:
             try:
                 data = {
                     "score": score,
@@ -79,36 +72,31 @@ class RedisManager:
                     "last_updated": int(time.time()),
                 }
                 self._client.set(f"topic:{topic_name}", json.dumps(data))
-                # logger.info(f"💾 Disimpan ke Redis: {topic_name} -> {score}")
             except Exception as e:
                 logger.warning(f"⚠️ Gagal menyimpan ke Redis: {e}")
 
     def get_topic_score(self, topic_name: str) -> dict:
-        """Mengambil skor topik (Prioritas: Redis -> SQLite)"""
-        if self._use_redis:
+        """Mengambil skor topik (Prioritas: Redis -> MongoDB)"""
+        if self._use_redis and self._client:
             try:
                 data_str = self._client.get(f"topic:{topic_name}")
                 if data_str:
-                    return json.loads(data_str)
+                    return json.loads(str(data_str))
             except Exception as e:
-                logger.warning(f"⚠️ Gagal membaca Redis: {e}. Fallback SQLite.")
+                logger.warning(f"⚠️ Gagal membaca Redis: {e}. Fallback MongoDB.")
 
-        # Fallback ke SQLite
-        session = SessionLocal()
+        # Fallback ke MongoDB
         try:
-            topic = (
-                session.query(TopicMemory)
-                .filter(TopicMemory.name == topic_name)
-                .first()
-            )
+            topic = db.topic_memory.find_one({"name": topic_name})
             if topic:
-                return {"score": topic.score, "times_chosen": topic.times_chosen}
+                return {
+                    "score": topic.get("score", 0.0),
+                    "times_chosen": topic.get("times_chosen", 0)
+                }
             return {"score": 0.0, "times_chosen": 0}
         except Exception as e:
-            logger.error(f"❌ Gagal membaca SQLite: {e}")
+            logger.error(f"❌ Gagal membaca MongoDB: {e}")
             return {"score": 0.0, "times_chosen": 0}
-        finally:
-            session.close()
 
     def is_task_active(self, topic_name: str) -> bool:
         """Mengecek apakah topik sedang diproses (terkunci) oleh worker lain"""
@@ -123,7 +111,6 @@ class RedisManager:
         """Menambahkan topik ke daftar tugas aktif (dikunci) dengan waktu kadaluarsa"""
         if self._use_redis and self._client:
             try:
-                # Kunci maksimal (misal 1 jam) agar tidak menyangkut jika worker terputus/crash
                 self._client.setex(
                     f"active_task:{topic_name}", expiry_seconds, "locked"
                 )
@@ -139,20 +126,20 @@ class RedisManager:
                 logger.warning(f"⚠️ Gagal menghapus kunci tugas di Redis: {e}")
 
     def get_all_topics(self):
-        """Mendapatkan semua topik dari SQLite untuk Leaderboard"""
-        session = SessionLocal()
+        """Mendapatkan semua topik dari MongoDB untuk Leaderboard"""
         try:
-            topics = session.query(TopicMemory).order_by(TopicMemory.score.desc()).all()
-            result = [
-                {"name": t.name, "score": t.score, "times_chosen": t.times_chosen}
+            topics = list(db.topic_memory.find().sort("score", -1))
+            return [
+                {
+                    "name": t["name"],
+                    "score": t["score"],
+                    "times_chosen": t.get("times_chosen", 0)
+                }
                 for t in topics
             ]
-            return result
         except Exception as e:
-            logger.error(f"❌ Gagal mengambil semua topik dari SQLite: {e}")
+            logger.error(f"❌ Gagal mengambil semua topik dari MongoDB: {e}")
             return []
-        finally:
-            session.close()
 
 
 redis_client = RedisManager()

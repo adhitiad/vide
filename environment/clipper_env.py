@@ -4,7 +4,7 @@ import numpy as np
 import datetime
 from logger import logger
 from data.redis_client import redis_client
-from data.database import SessionLocal
+from data.mongodb_client import db
 from data.models import PublishedVideo
 from core.downloader import downloader
 from core.editor import video_editor
@@ -103,7 +103,6 @@ class ContentCreatorEnv(gym.Env):
         platform: str,
         platform_video_id: Optional[str] = None,
     ):
-        session = SessionLocal()
         try:
             new_video = PublishedVideo(
                 platform=platform,
@@ -113,14 +112,11 @@ class ContentCreatorEnv(gym.Env):
                 performance_status="PENDING",
                 platform_video_id=platform_video_id,
             )
-            session.add(new_video)
-            session.commit()
-            logger.info(f"💾 Disimpan ke DB ({platform}): {video_url}")
+            # MongoDB Insert
+            db.published_videos.insert_one(new_video.to_dict())
+            logger.info(f"💾 Disimpan ke MongoDB ({platform}): {video_url}")
         except Exception as e:
-            session.rollback()
-            logger.error(f"❌ Gagal menyimpan PublishedVideo: {e}")
-        finally:
-            session.close()
+            logger.error(f"❌ Gagal menyimpan PublishedVideo ke MongoDB: {e}")
 
     def _check_last_performance(self) -> dict:
         """
@@ -142,21 +138,18 @@ class ContentCreatorEnv(gym.Env):
             "fresh_topic": None,
         }
 
-        session = SessionLocal()
         try:
             # Window evaluasi: video yang sudah lebih dari 24 jam dipublish
             window_start = datetime.datetime.utcnow() - datetime.timedelta(hours=48)
             window_end = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
 
-            low_videos = (
-                session.query(PublishedVideo)
-                .filter(
-                    PublishedVideo.published_at >= window_start,
-                    PublishedVideo.published_at <= window_end,
-                    PublishedVideo.performance_status == "LOW_VIEWS",
-                )
-                .all()
-            )
+            # Query MongoDB: Filter berdasarkan rentang waktu dan status
+            low_videos_data = db.published_videos.find({
+                "published_at": {"$gte": window_start, "$lte": window_end},
+                "performance_status": "LOW_VIEWS"
+            })
+            
+            low_videos = [PublishedVideo.from_dict(v) for v in low_videos_data]
 
             if not low_videos:
                 return result  # Semua baik-baik saja
@@ -209,8 +202,6 @@ class ContentCreatorEnv(gym.Env):
 
         except Exception as e:
             logger.error(f"❌ [SELF-CORRECTION] Gagal cek performa DB: {e}")
-        finally:
-            session.close()
 
         return result
 
@@ -398,66 +389,44 @@ class ContentCreatorEnv(gym.Env):
                     "sensasi",
                 ]
 
-                # 2. DISTRIBUSI: YouTube & Instagram
-                # Generate komentar provokatif — mode agresif jika dipicu Self-Correction
-                provocative_comment = generate_provocative_comment(
-                    description, selected_topic, is_aggressive=is_aggressive
-                )
+                # 2. SISTEM DISTRIBUSI ANTREAN (STAGGERED UPLOAD)
+                from data.models import UploadQueue
+                try:
+                    now_utc = datetime.datetime.utcnow()
+                    
+                    platforms = [
+                        ("youtube", 0),
+                        ("instagram", 30),
+                        ("facebook", 60),
+                        ("tiktok", 120)
+                    ]
 
-                yt_url = youtube_uploader.upload_to_youtube_shorts(
-                    str(output_video_path),
-                    title,
-                    description,
-                    tags,
-                    comment_text=provocative_comment,
-                )
-                if yt_url:
-                    # Ekstrak YouTube video ID untuk analytics_tracker
-                    yt_video_id: Optional[str] = None
-                    if "/shorts/" in yt_url:
-                        yt_video_id = yt_url.split("/shorts/")[-1].split("?")[0].strip()
+                    for plat, delay in platforms:
+                        desc = description
+                        if plat == "instagram":
+                            desc = f"{title}\n\n{cta_used}\n\n#reelsindonesia #viral"
+                        elif plat == "facebook":
+                            desc = f"{title}\n\n{cta_used}"
+                        elif plat == "tiktok":
+                            desc = f"{title} 🔥 #fyp #indonesia #viral"
 
-                    info["url_yt"] = yt_url
-                    self._save_published_video(
-                        selected_topic, yt_url, "youtube",
-                        platform_video_id=yt_video_id,
-                    )
+                        q_item = UploadQueue(
+                            platform=plat,
+                            video_path=str(output_video_path),
+                            title=title,
+                            description=desc,
+                            tags=",".join(tags),
+                            topic_name=selected_topic,
+                            scheduled_at=now_utc + datetime.timedelta(minutes=delay)
+                        )
+                        db.upload_queue.insert_one(q_item.to_dict())
 
-                    # Backup video sukses ke data/ytUpload
-                    if output_video_path:
-                        import shutil
-                        import os as _os2
-
-                        yt_upload_dir = "data/ytUpload"
-                        _os2.makedirs(yt_upload_dir, exist_ok=True)
-                        try:
-                            new_path = _os2.path.join(
-                                yt_upload_dir, _os2.path.basename(str(output_video_path))
-                            )
-                            shutil.copy(str(output_video_path), new_path)
-                            logger.info(f"📂 Video sukses YT disimpan ke: {new_path}")
-                        except Exception as copy_err:
-                            logger.error(f"❌ Gagal backup video ke ytUpload: {copy_err}")
-                else:
-                    reward -= 1.0  # Penalti karena gagal YT
-
-                ig_caption = f"{title}\n\n{cta_used}\n\n#reelsindonesia #viral"
-                ig_url = ig_uploader.upload_to_reels(str(output_video_path), ig_caption)
-                if ig_url:
-                    # Ekstrak IG media code untuk analytics_tracker
-                    ig_media_code: Optional[str] = None
-                    if "/reel/" in ig_url:
-                        ig_media_code = ig_url.split("/reel/")[-1].strip("/").split("/")[0]
-
-                    info["url_ig"] = ig_url
-                    self._save_published_video(
-                        selected_topic, ig_url, "instagram",
-                        platform_video_id=ig_media_code,
-                    )
-                # IG sering strict, tidak beri penalti berat jika gagal
-
-                if yt_url or ig_url:
+                    logger.info("📋 4 Tugas Upload (YT, IG, FB, TT) telah masuk antrean (Staggered/MongoDB).")
                     info["success"] = True
+                except Exception as qe:
+                    logger.error(f"❌ Gagal antrekan upload: {qe}")
+                # Sistem antrean berhasil dijadwalkan
+                pass
 
             if video_path:
                 if isinstance(video_path, list):

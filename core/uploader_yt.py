@@ -1,12 +1,15 @@
 import os
 import pickle
 import datetime
+from typing import Optional
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 from logger import logger
+from data.mongodb_client import db
+from data.models import UploadQueue
 
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -108,42 +111,38 @@ class YouTubeUploader:
         Program TIDAK akan crash — error dicatat di DB dan di-retry besok.
         """
         try:
-            from data.database import SessionLocal
-            from data.models import UploadQueue
+            update_data = {
+                "status": status,
+                "last_error": error_msg,
+                "error_code": error_code
+            }
 
-            session = SessionLocal()
-            try:
-                record = session.query(UploadQueue).filter(UploadQueue.id == queue_id).first()
-                if not record:
-                    return
+            if published_url:
+                update_data["published_url"] = published_url
+                update_data["published_at"] = datetime.datetime.utcnow()
 
-                record.status = status
-                record.last_error = error_msg
-                record.error_code = error_code
-                if published_url:
-                    record.published_url = published_url
-                    record.published_at = datetime.datetime.utcnow()
-                if status == "failed":
-                    record.retry_count = (record.retry_count or 0) + 1
+            if status == "failed":
+                # Find current record to get retry count
+                record_data = db.upload_queue.find_one({"_id": queue_id})
+                if record_data:
+                    current_retry = record_data.get("retry_count", 0)
+                    update_data["retry_count"] = current_retry + 1
+                    
                     # Jadwalkan retry besok jam 14:30 WIB (setelah quota reset)
                     tomorrow = datetime.datetime.utcnow() + datetime.timedelta(days=1)
-                    record.next_retry_at = tomorrow.replace(hour=7, minute=30, second=0)
+                    update_data["next_retry_at"] = tomorrow.replace(hour=7, minute=30, second=0)
+                    
                     # Marking abandoned jika sudah melebihi batas retry
-                    if record.retry_count >= record.max_retries:
-                        record.status = "abandoned"
+                    if update_data["retry_count"] >= record_data.get("max_retries", 3):
+                        update_data["status"] = "abandoned"
                         logger.warning(
-                            f"🚫 [QUEUE] Video '{record.title[:40]}' diabaikan setelah {record.retry_count}x gagal."
+                            f"🚫 [QUEUE] Video ID={queue_id} diabaikan setelah {update_data['retry_count']}x gagal."
                         )
 
-                session.commit()
-                logger.info(f"💾 [QUEUE] Status video ID={queue_id} diupdate → '{status}'")
-            except Exception as db_err:
-                logger.error(f"❌ [QUEUE] Gagal update status DB: {db_err}")
-                session.rollback()
-            finally:
-                session.close()
-        except ImportError:
-            pass  # Jika database belum tersedia, cukup log saja
+            db.upload_queue.update_one({"_id": queue_id}, {"$set": update_data})
+            logger.info(f"💾 [QUEUE] Status video ID={queue_id} diupdate → '{status}'")
+        except Exception as e:
+            logger.error(f"❌ [QUEUE] Gagal update status DB: {e}")
 
     def add_to_queue(
         self,
@@ -152,39 +151,28 @@ class YouTubeUploader:
         description: str,
         tags: list = None,
         topic_name: str = "",
-    ) -> int:
+    ) -> Optional[str]:
         """
         Tambahkan video ke antrian upload (UploadQueue) tanpa langsung mengupload.
         Bot akan upload saat jadwal prime time tiba.
-        Returns: ID record di tabel UploadQueue (atau -1 jika gagal)
+        Returns: ID record di koleksi MongoDB (atau None jika gagal)
         """
         try:
-            from data.database import SessionLocal
-            from data.models import UploadQueue
-
-            session = SessionLocal()
-            try:
-                tags_csv = ",".join(tags) if tags else ""
-                record = UploadQueue(
-                    video_path=video_path,
-                    title=title,
-                    description=description,
-                    tags=tags_csv,
-                    topic_name=topic_name,
-                    status="pending",
-                )
-                session.add(record)
-                session.commit()
-                logger.info(f"📥 [QUEUE] Video '{title[:50]}' masuk antrian (ID={record.id})")
-                return record.id
-            except Exception as e:
-                logger.error(f"❌ [QUEUE] Gagal menambah ke antrian: {e}")
-                session.rollback()
-                return -1
-            finally:
-                session.close()
-        except ImportError:
-            return -1
+            tags_csv = ",".join(tags) if tags else ""
+            record = UploadQueue(
+                video_path=video_path,
+                title=title,
+                description=description,
+                tags=tags_csv,
+                topic_name=topic_name,
+                status="pending",
+            )
+            result = db.upload_queue.insert_one(record.to_dict())
+            logger.info(f"📥 [QUEUE] Video '{title[:50]}' masuk antrian (ID={result.inserted_id})")
+            return result.inserted_id
+        except Exception as e:
+            logger.error(f"❌ [QUEUE] Gagal menambah ke antrian: {e}")
+            return None
 
     def upload_to_youtube_shorts(
         self,

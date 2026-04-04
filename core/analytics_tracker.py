@@ -23,7 +23,7 @@ import datetime
 from typing import Optional
 
 from logger import logger
-from data.database import SessionLocal
+from data.mongodb_client import db
 from data.models import PublishedVideo
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -74,7 +74,9 @@ def _get_youtube_client():
                 with open("token.pickle", "wb") as token:
                     pickle.dump(credentials, token)
             else:
-                logger.error("❌ [Analytics] Token YouTube tidak valid. Jalankan auth ulang.")
+                logger.error(
+                    "❌ [Analytics] Token YouTube tidak valid. Jalankan auth ulang."
+                )
                 return None
 
         youtube = build("youtube", "v3", credentials=credentials)
@@ -104,7 +106,9 @@ def _get_ig_client():
             cl.load_settings(session_file)
             cl.login(username, password)
         else:
-            logger.warning("⚠️ [Analytics] ig_session.json tidak ditemukan. Skip analytics IG.")
+            logger.warning(
+                "⚠️ [Analytics] ig_session.json tidak ditemukan. Skip analytics IG."
+            )
             return None
 
         return cl
@@ -127,24 +131,29 @@ def update_youtube_stats() -> dict:
 
     youtube = _get_youtube_client()
     if not youtube:
-        logger.error("❌ [Analytics YT] Melewati update YT karena client tidak tersedia.")
+        logger.error(
+            "❌ [Analytics YT] Melewati update YT karena client tidak tersedia."
+        )
         return summary
 
-    session = SessionLocal()
     try:
-        cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=TRACKING_WINDOW_DAYS)
-        videos = (
-            session.query(PublishedVideo)
-            .filter(
-                PublishedVideo.platform == "youtube",
-                PublishedVideo.published_at >= cutoff_date,
-                PublishedVideo.performance_status != "VIRAL",  # VIRAL sudah tidak perlu ditrack ketat
-            )
-            .all()
+        cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(
+            days=TRACKING_WINDOW_DAYS
+        )
+        videos_data = db.published_videos.find(
+            {
+                "platform": "youtube",
+                "published_at": {"$gte": cutoff_date},
+                "performance_status": {"$ne": "VIRAL"},
+            }
         )
 
+        videos = [PublishedVideo.from_dict(v) for v in videos_data]
+
         if not videos:
-            logger.info("ℹ️ [Analytics YT] Tidak ada video YouTube untuk ditracking dalam 7 hari.")
+            logger.info(
+                "ℹ️ [Analytics YT] Tidak ada video YouTube untuk ditracking dalam 7 hari."
+            )
             return summary
 
         logger.info(f"📋 [Analytics YT] Memproses {len(videos)} video YouTube...")
@@ -152,7 +161,7 @@ def update_youtube_stats() -> dict:
         # Batch request per 50 video (limit YouTube Data API)
         batch_size = 50
         for i in range(0, len(videos), batch_size):
-            batch = videos[i: i + batch_size]
+            batch = videos[i : i + batch_size]
 
             # Kumpulkan video ID dari platform_video_id atau ekstrak dari URL
             id_to_video = {}
@@ -174,9 +183,7 @@ def update_youtube_stats() -> dict:
             # Satu API call untuk seluruh batch (hemat quota)
             try:
                 response = (
-                    youtube.videos()
-                    .list(part="statistics", id=video_ids_str)
-                    .execute()
+                    youtube.videos().list(part="statistics", id=video_ids_str).execute()
                 )
             except Exception as api_err:
                 logger.error(
@@ -205,13 +212,19 @@ def update_youtube_stats() -> dict:
                     new_status = _evaluate_and_update_status(video)
                     old_status = video.performance_status
 
-                    if new_status != old_status:
-                        video.performance_status = new_status
-                        logger.info(
-                            f"   📈 Status berubah: '{video.topic_name}' "
-                            f"{old_status} → {new_status} "
-                            f"(views={video.views}, {video.hours_since_published:.1f}j)"
-                        )
+                    # Update di MongoDB
+                    db.published_videos.update_one(
+                        {"_id": video._id},
+                        {
+                            "$set": {
+                                "views": video.views,
+                                "likes": video.likes,
+                                "comments": video.comments,
+                                "last_checked": video.last_checked,
+                                "performance_status": video.performance_status,
+                            }
+                        },
+                    )
 
                     summary["updated"] += 1
                     if new_status == "LOW_VIEWS":
@@ -224,7 +237,7 @@ def update_youtube_stats() -> dict:
 
                 except Exception as update_err:
                     logger.error(
-                        f"❌ [Analytics YT] Gagal update video ID={video.id}: {update_err}"
+                        f"❌ [Analytics YT] Gagal update video URL={video.video_url}: {update_err}"
                     )
                     summary["failed"] += 1
 
@@ -238,7 +251,6 @@ def update_youtube_stats() -> dict:
                     )
                     summary["failed"] += 1
 
-        session.commit()
         logger.info(
             f"✅ [Analytics YT] Selesai. "
             f"Updated={summary['updated']}, "
@@ -249,9 +261,6 @@ def update_youtube_stats() -> dict:
 
     except Exception as e:
         logger.error(f"❌ [Analytics YT] Error fatal: {e}")
-        session.rollback()
-    finally:
-        session.close()
 
     return summary
 
@@ -269,21 +278,24 @@ def update_instagram_stats() -> dict:
 
     ig_client = _get_ig_client()
     if not ig_client:
-        logger.warning("⚠️ [Analytics IG] Skip Instagram analytics (client tidak tersedia).")
+        logger.warning(
+            "⚠️ [Analytics IG] Skip Instagram analytics (client tidak tersedia)."
+        )
         return summary
 
-    session = SessionLocal()
     try:
-        cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=TRACKING_WINDOW_DAYS)
-        videos = (
-            session.query(PublishedVideo)
-            .filter(
-                PublishedVideo.platform == "instagram",
-                PublishedVideo.published_at >= cutoff_date,
-                PublishedVideo.performance_status != "VIRAL",
-            )
-            .all()
+        cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(
+            days=TRACKING_WINDOW_DAYS
         )
+        videos_data = db.published_videos.find(
+            {
+                "platform": "instagram",
+                "published_at": {"$gte": cutoff_date},
+                "performance_status": {"$ne": "VIRAL"},
+            }
+        )
+
+        videos = [PublishedVideo.from_dict(v) for v in videos_data]
 
         if not videos:
             logger.info("ℹ️ [Analytics IG] Tidak ada video IG untuk ditracking.")
@@ -305,21 +317,28 @@ def update_instagram_stats() -> dict:
                 media_info = ig_client.media_info(media_pk)
 
                 # Ambil statistik (field name bisa bervariasi tergantung API response)
-                video.views = getattr(media_info, "view_count", 0) or getattr(media_info, "play_count", 0) or 0
+                video.views = (
+                    getattr(media_info, "view_count", 0)
+                    or getattr(media_info, "play_count", 0)
+                    or 0
+                )
                 video.likes = getattr(media_info, "like_count", 0) or 0
                 video.comments = getattr(media_info, "comment_count", 0) or 0
                 video.last_checked = datetime.datetime.utcnow()
 
-                new_status = _evaluate_and_update_status(video)
-                old_status = video.performance_status
-
-                if new_status != old_status:
-                    video.performance_status = new_status
-                    logger.info(
-                        f"   📈 IG Status: '{video.topic_name}' "
-                        f"{old_status} → {new_status} "
-                        f"(views={video.views})"
-                    )
+                # Update di MongoDB
+                db.published_videos.update_one(
+                    {"_id": video._id},
+                    {
+                        "$set": {
+                            "views": video.views,
+                            "likes": video.likes,
+                            "comments": video.comments,
+                            "last_checked": video.last_checked,
+                            "performance_status": video.performance_status,
+                        }
+                    },
+                )
 
                 summary["updated"] += 1
                 if new_status == "LOW_VIEWS":
@@ -337,7 +356,6 @@ def update_instagram_stats() -> dict:
                 summary["failed"] += 1
                 # Jangan stop loop, lanjutkan ke video berikutnya
 
-        session.commit()
         logger.info(
             f"✅ [Analytics IG] Selesai. "
             f"Updated={summary['updated']}, "
@@ -348,9 +366,6 @@ def update_instagram_stats() -> dict:
 
     except Exception as e:
         logger.error(f"❌ [Analytics IG] Error fatal: {e}")
-        session.rollback()
-    finally:
-        session.close()
 
     return summary
 
@@ -383,6 +398,7 @@ def run_all_trackers():
 # ──────────────────────────────────────────────────────────────────────────────
 # Helper Functions
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _extract_youtube_id(video: PublishedVideo) -> Optional[str]:
     """
@@ -420,6 +436,7 @@ def _extract_ig_media_pk(video: PublishedVideo) -> Optional[str]:
         code = url.split("/reel/")[-1].strip("/").split("/")[0]
         try:
             from instagrapi import Client
+
             # Gunakan static method untuk konversi (tidak perlu login)
             cl = Client()
             pk = cl.media_pk_from_code(code)

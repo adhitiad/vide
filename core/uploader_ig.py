@@ -1,87 +1,127 @@
 import os
 import time
+import json
+import random
+from pathlib import Path
 from instagrapi import Client
+from instagrapi.exceptions import (
+    ChallengeRequired,
+    FeedbackRequired,
+    LoginRequired,
+    MediaError,
+    ClientError,
+)
 from logger import logger
+from typing import Optional
 
-# ==============================================================================
-# ⚠️ PENTING UNTUK USER ⚠️
-# Anda WAJIB mengatur Env Vars `IG_USERNAME` dan `IG_PASSWORD`
-# Sesi login akan disimpan di `ig_session.json` agar tidak diblokir Instagram.
-# ==============================================================================
 
 class InstagramUploader:
     def __init__(self):
         self.cl = Client()
-        self.session_file = "ig_session.json"
+        self.session_file = os.path.join("data", "ig_session.json")
+        os.makedirs("data", exist_ok=True)
+        self.username = os.getenv("IG_USERNAME")
+        self.password = os.getenv("IG_PASSWORD")
         self.is_authenticated = False
-        self._authenticate()
+        self.cl.request_timeout = 120  # 2 Menit timeout
 
-    def _authenticate(self):
-        username = os.getenv("IG_USERNAME")
-        password = os.getenv("IG_PASSWORD")
-
-        if not username or not password:
-            logger.warning("⚠️ Kredensial IG (IG_USERNAME/IG_PASSWORD) kosong. Auto-Upload IG Reels Mati.")
-            return
+    def _authenticate(self) -> bool:
+        """
+        Sistem Autentikasi dengan Session Caching & Challenge Detection.
+        """
+        if not self.username or not self.password:
+            logger.error("❌ IG_USERNAME/PASSWORD kosong. Periksa file .env Anda!")
+            return False
 
         try:
-            # Login via session caching
+            # 1. Load Session
             if os.path.exists(self.session_file):
-                logger.info("🔄 Membuka sesi Instagram lama...")
-                self.cl.load_settings(self.session_file)
-                self.cl.login(username, password)
-                self.cl.get_timeline_feed() # Cek sesi masih valid
-            else:
-                logger.info("🔐 Meminta autentikasi Instagram baru...")
-                # Beri jeda kecil agar request tidak dicurigai
-                time.sleep(2)
-                self.cl.login(username, password)
+                logger.info("🔄 Memuat sesi Instagram lama...")
+                try:
+                    self.cl.load_settings(self.session_file)
+                    self.cl.login(self.username, self.password)
+                    # Test session
+                    self.cl.get_timeline_feed()
+                    logger.info(f"✅ Sesi VALID. Login sebagai @{self.username}")
+                    self.is_authenticated = True
+                    return True
+                except LoginRequired:
+                    logger.warning("⚠️ Sesi login kadaluarsa, mencoba re-login...")
+                    if os.path.exists(self.session_file):
+                        os.remove(self.session_file)
+                except Exception as e:
+                    logger.warning(f"⚠️ Sesi corrupt: {e}")
+                    if os.path.exists(self.session_file):
+                        os.remove(self.session_file)
+
+            # 2. Fresh Login
+            logger.info(f"🔐 Login baru ke Instagram: @{self.username}")
+            time.sleep(random.uniform(2, 5))
+
+            if self.cl.login(self.username, self.password):
                 self.cl.dump_settings(self.session_file)
+                logger.info("✅ Login berhasil & Sesi baru disimpan.")
+                self.is_authenticated = True
+                return True
 
-            self.is_authenticated = True
-            logger.info(f"✅ Terautentikasi Instagram sebagai @{username}.")
-        except Exception as e:
-            logger.error(f"❌ Autentikasi Instagram Gagal: {e}")
-            # Hapus sesi usang jika login ditolak
-            if "login_required" in str(e).lower() and os.path.exists(self.session_file):
-                os.remove(self.session_file)
-            self.is_authenticated = False
+            return False
 
-    def upload_to_reels(self, video_path: str, caption: str) -> str:
-        """Mengunggah video ke IG Reels via API Privat Instagrapi"""
-        if not self.is_authenticated:
-            logger.warning("⚠️ IG Uploader tidak aktif. Lewati proses Reels.")
-            return None
-
-        if not os.path.exists(video_path):
-            logger.error(f"❌ Video Reels tidak ditemukan: {video_path}")
-            return None
-
-        # Instagrapi butuh video rasio tertentu, editor.py kita sudah 9:16 (720x1280)
-        logger.info("📤 Memulai Upload IG Reels...")
-        try:
-            # Upload clip to reels
-            media = self.cl.clip_upload(
-                video_path,
-                caption,
-                extra_data={
-                    "custom_accessibility_caption": "AI Generated Opini Video",
-                    "like_and_view_counts_disabled": 0,
-                    "disable_comments": 0,
-                }
+        except ChallengeRequired:
+            logger.error(
+                "🛡️ Instagram CHALLENGE! Buka aplikasi IG di HP Anda untuk verifikasi."
             )
+            return False
+        except FeedbackRequired:
+            logger.error(
+                "🛑 Instagram FEEDBACK REQUIRED! Akun Anda dibatasi sementara."
+            )
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error Auth Instagram: {e}")
+            return False
 
-            # Mendapatkan tautan web
-            if media and media.pk:
-                ig_url = f"https://www.instagram.com/reel/{media.code}/"
-                logger.info(f"🎉 Upload IG Reels BERHASIL! {ig_url}")
-                return ig_url
-            else:
-                logger.error("❌ Reels Upload selesai tapi ID Media kosong.")
+    def upload_to_ig_reels(
+        self, video_path: str, caption: str, max_retries: int = 2
+    ) -> Optional[str]:
+        """
+        Refined Upload dengan retry dan penanganan media error.
+        """
+        if not os.path.exists(video_path):
+            return None
+
+        # Re-auth check
+        if not self.is_authenticated:
+            if not self._authenticate():
                 return None
 
-        except Exception as e:
-            logger.error(f"❌ Instagram Reels Upload GAGAL: {e}")
-            return None
+        for attempt in range(1, max_retries + 1):
+            logger.info(f"📤 Upload ke IG Reels (Mencoba {attempt}/{max_retries})...")
+            try:
+                # Menambahkan variasi delay
+                time.sleep(random.uniform(3, 7))
+
+                # Posting Reel
+                media = self.cl.clip_upload(Path(video_path), caption=caption)
+
+                if media and media.code:
+                    url = f"https://www.instagram.com/reels/{media.code}/"
+                    logger.info(f"✨ SUKSES! IG Reel Online: {url}")
+                    return url
+
+                logger.error("❌ Upload selesai tapi tidak ada ID media.")
+
+            except (MediaError, ClientError) as e:
+                logger.warning(f"⚠️ Media/Client Error pada percobaan {attempt}: {e}")
+                if "login_required" in str(e).lower():
+                    self.is_authenticated = False
+                    self._authenticate()
+            except Exception as e:
+                logger.error(f"❌ Fatal Error IG Upload: {e}")
+
+            if attempt < max_retries:
+                time.sleep(10)
+
+        return None
+
 
 ig_uploader = InstagramUploader()

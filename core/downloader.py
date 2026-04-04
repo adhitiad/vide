@@ -21,9 +21,11 @@ class VideoDownloader:
         # Track filepath yang benar-benar diunduh via hook
         downloaded_filepath: list[str] = []
 
-        def postprocessor_hook(d):
-            if d['status'] == 'finished':
-                filepath = d.get('info_dict', {}).get('filepath') or d.get('filename', '')
+        def post_hook(*args):
+            # Hook khusus untuk post-processor (Merger/MoveFiles)
+            d = args[-1]
+            if d['status'] == 'finished' and d.get('postprocessor') in ['MoveFiles', 'Merger']:
+                filepath = d.get('info_dict', {}).get('filepath')
                 if filepath and os.path.exists(filepath):
                     downloaded_filepath.append(filepath)
 
@@ -38,11 +40,13 @@ class VideoDownloader:
                 pass
             return None  # None berarti video diterima / lolos filter
 
-        # Deteksi ffmpeg dari imageio_ffmpeg (bundled) sebagai fallback
+        # Deteksi ffmpeg dari imageio_ffmpeg (WAJIB untuk Windows/Enviroment terbatas)
         try:
             import imageio_ffmpeg
             ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-        except ImportError:
+            logger.info(f"✅ FFmpeg ditemukan via imageio-ffmpeg: {ffmpeg_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ Gagal memuat imageio-ffmpeg: {e}. Menggunakan fallback 'ffmpeg'.")
             ffmpeg_path = "ffmpeg"
 
         # Deteksi Node.js sebagai JS runtime untuk yt-dlp agar format lengkap tersedia
@@ -51,16 +55,17 @@ class VideoDownloader:
         js_runtimes = f"nodejs:{node_path}" if node_path else None
 
         ydl_opts = {
-            # Utamakan format mp4 lengkap (audio+video), fallback ke webm/best
-            'format': 'best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=webm]/best',
+            # Utamakan format mp4 lengkap, fallback ke webm
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'outtmpl': output_template,
             'noplaylist': True,
             'match_filter': duration_filter,
             'ffmpeg_location': ffmpeg_path,
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False, # Ubah ke False untuk debugging jika terjadi error lagi
+            'no_warnings': False,
             'extract_audio': False,
-            'progress_hooks': [postprocessor_hook],
+            'postprocessor_hooks': [post_hook],
+            'merge_output_format': 'mp4',
         }
 
         # Tambahkan Node.js JS runtime jika tersedia (menghilangkan WARNING)
@@ -129,13 +134,16 @@ class VideoDownloader:
 
                 # Metode 2: Cari semua file dengan video_id di folder download (glob fallback)
                 all_files = glob.glob(os.path.join(self.download_dir, f"{video_id}.*"))
-                # Filter hanya file video (bukan .part / .ytdl / .json)
+                
+                # Prioritaskan file .mp4, lalu format video lainnya
                 video_exts = {'.mp4', '.webm', '.mkv', '.mov', '.avi', '.flv', '.ts', '.m4v'}
                 video_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
+                video_files.sort(key=lambda x: x.lower().endswith('.mp4'), reverse=True)
 
                 if video_files:
-                    logger.info(f"✅ Berhasil mengunduh video UGC (glob): {video_files[0]}")
-                    return video_files[0]
+                    fpath = video_files[0]
+                    logger.info(f"✅ Berhasil mengunduh video UGC (glob): {fpath}")
+                    return fpath
 
                 logger.error(f"❌ Gagal mendapatkan file video secara lokal. File ditemukan: {all_files}")
                 return None

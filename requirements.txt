@@ -12,6 +12,8 @@ opencv-python
 # Video & Media
 moviepy
 yt-dlp
+imageio-ffmpeg
+pymongo
 
 # Web API & Dashboard
 fastapi
@@ -21,17 +23,17 @@ websockets
 requests
 
 # Database & Cache
-sqlalchemy
 redis
 
 # Scheduling & Utilities
 apscheduler
 
-# Uploaders (YouTube & Instagram)
+# Uploaders (YouTube, Instagram, TikTok)
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
 instagrapi
+playwright
 langchain
 langchain-groq
 langchain-core
