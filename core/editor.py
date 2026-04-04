@@ -86,6 +86,9 @@ class VideoEditor:
                 model_selection=1, min_detection_confidence=0.5
             )
 
+            # State tracking to only detect face every 0.5s for performance boost
+            track_state = {"x": w // 2, "time": -1.0}
+
             def crop_frame(get_frame, t):
                 frame = get_frame(t)
 
@@ -94,17 +97,21 @@ class VideoEditor:
 
                 # Coba deteksi wajah setiap detik untuk optimasi
                 # Karena moviepy get_frame berjalan per frame, tracking per frame sangat lambat.
-                # Sebagai kompromi, kita pakai MediaPipe pada frame yang di-resize
-                small_frame = cv2.resize(frame, (small_w, small_h))
-                results = face_detection.process(
-                    cv2.cvtColor(small_frame, cv2.COLOR_RGB2BGR)
-                )
+                # Bolt Optimization: Reuse face position periodically to massively speed up rendering
+                if t - track_state["time"] >= 0.5:
+                    small_frame = cv2.resize(frame, (small_w, small_h))
+                    results = face_detection.process(
+                        cv2.cvtColor(small_frame, cv2.COLOR_RGB2BGR)
+                    )
 
-                if results.detections:
-                    # Ambil wajah pertama
-                    bbox = results.detections[0].location_data.relative_bounding_box
-                    x_center_rel = bbox.xmin + (bbox.width / 2)
-                    x_center = int(x_center_rel * w)
+                    if results.detections:
+                        # Ambil wajah pertama
+                        bbox = results.detections[0].location_data.relative_bounding_box
+                        x_center_rel = bbox.xmin + (bbox.width / 2)
+                        track_state["x"] = int(x_center_rel * w)
+                    track_state["time"] = t
+
+                x_center = track_state["x"]
 
                 # Batasi x_center agar tidak crop ke luar batas
                 target_ratio = target_w / target_h
