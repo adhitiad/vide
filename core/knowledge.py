@@ -16,17 +16,21 @@ class KnowledgeBase:
             return False
 
         try:
+            # Karena RL atau Model AI sering menghasilkan tipe data NumPy (float64/int64)
+            # kita harus memastikannya menjadi tipe data standar Python agar JSON serializable.
+            reward_val = float(reward)
+            duration_val = float(video_data.get("duration", 0))
+
             # Format JSON sesuai instruksi (Instruksi -> Input -> Output)
-            # Ini sangat berguna untuk fine-tuning LLM seperti Llama atau Mistral
             dataset_entry = {
                 "instruction": f"Buatkan naskah video pendek (Shorts/Reels) yang menarik tentang topik '{topic}'.",
                 "input": f"Gunakan gaya bahasa ini dan tambahkan CTA '{video_data.get('cta_used', '')}'.",
                 "output": video_data.get("transcript", ""),
                 "metadata": {
-                    "topic": topic,
-                    "simulated_reward": reward,
+                    "topic": str(topic),
+                    "simulated_reward": round(reward_val, 4),
                     "timestamp": datetime.datetime.now().isoformat(),
-                    "duration_seconds": video_data.get("duration", 0)
+                    "duration_seconds": round(duration_val, 2)
                 }
             }
 
