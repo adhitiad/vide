@@ -51,3 +51,4 @@ client_secret*.json
 data/output/
 modulTrain/
 temp_audio_analyze_*.wav
+token.pickle

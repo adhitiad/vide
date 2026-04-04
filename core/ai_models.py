@@ -7,12 +7,24 @@ from logger import logger
 # Jika ffmpeg tidak ada di PATH Windows, inject dari imageio_ffmpeg (bundled).
 try:
     import imageio_ffmpeg
+    import shutil
 
     _ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     _ffmpeg_dir = os.path.dirname(_ffmpeg_exe)
+    
+    # Whisper secara hardcode memanggil perintah "ffmpeg"
+    # Di Windows, exe bawaan imageio_ffmpeg bernama "ffmpeg-win64-..."
+    # Kita harus buat alias (copy) dengan nama "ffmpeg.exe"
+    _ffmpeg_alias = os.path.join(_ffmpeg_dir, "ffmpeg.exe")
+    if not os.path.exists(_ffmpeg_alias) and _ffmpeg_exe != _ffmpeg_alias:
+        try:
+            shutil.copyfile(_ffmpeg_exe, _ffmpeg_alias)
+        except Exception as copy_err:
+            logger.warning(f"⚠️ Gagal membuat alias ffmpeg.exe: {copy_err}")
+    
     if _ffmpeg_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-    logger.info("🛠️ FFmpeg terdeteksi via imageio: %s", _ffmpeg_exe)
+    logger.info("🛠️ FFmpeg terdeteksi dan diinjeksi ke PATH: %s", _ffmpeg_exe)
 except Exception as e:
     logger.warning("⚠️ Gagal menginjeksi FFmpeg: %s", e)
 
@@ -73,7 +85,18 @@ class AIEngine:
         try:
             # Pastikan FFmpeg dalam PATH sesaat sebelum transkripsi (Windows Fix)
             import imageio_ffmpeg
-            ffmpeg_dir = os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+            import shutil
+            
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+            
+            ffmpeg_alias = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+            if not os.path.exists(ffmpeg_alias) and ffmpeg_exe != ffmpeg_alias:
+                try:
+                    shutil.copyfile(ffmpeg_exe, ffmpeg_alias)
+                except Exception:
+                    pass
+            
             if ffmpeg_dir not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
 
