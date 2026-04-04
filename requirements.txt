@@ -10,7 +10,7 @@ mediapipe
 opencv-python
 
 # Video & Media
-moviepy==1.0.3
+moviepy
 yt-dlp
 
 # Web API & Dashboard
@@ -33,6 +33,7 @@ google-auth-oauthlib
 google-auth-httplib2
 instagrapi
 langchain
-langchain-openai
+langchain-groq
 langchain-core
 python-dotenv
+pytz

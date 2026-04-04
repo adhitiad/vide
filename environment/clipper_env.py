@@ -1,6 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import datetime
 from logger import logger
 from data.redis_client import redis_client
 from data.database import SessionLocal
@@ -13,6 +14,7 @@ from core.uploader_yt import youtube_uploader
 from core.uploader_ig import ig_uploader
 from core.comment_generator import generate_provocative_comment
 from core.ai_models import ai_engine
+from typing import Optional
 
 
 class ContentCreatorEnv(gym.Env):
@@ -20,6 +22,11 @@ class ContentCreatorEnv(gym.Env):
     God-Tier Environment: Agen memilih (Topik + Profil Visual).
     Dilengkapi Spider Coordination untuk menghindari duplikasi antar worker.
     Reward dihitung berdasarkan simulasi Analisis Sentimen IndoBERT terhadap konten.
+
+    NEW: Self-Correction & Pivot Logic
+    - Setiap step() dimulai dengan memeriksa performa video 24-48 jam lalu.
+    - Jika ditemukan video LOW_VIEWS → aktifkan Aggressive Mode secara otomatis.
+    - Aggressive Mode: penalti topik di Redis, force pivot topik+visual, upload konten lebih agresif.
     """
 
     metadata = {"render_modes": ["console"]}
@@ -34,7 +41,6 @@ class ContentCreatorEnv(gym.Env):
         )
 
         # Action space = (Num_Topics * 3 Visuals) + 1 Aksi Riset
-        # Total kombinasi unik yang bisa dieksploitasi
         self.num_actions = (len(self.topics) * self.visual_profiles) + 1
         self.action_space = spaces.Discrete(self.num_actions)
 
@@ -69,9 +75,6 @@ class ContentCreatorEnv(gym.Env):
             data = redis_client.get_topic_score(topic)
             base_score = data.get("score", 0.0)
 
-            # Kita bagi base_score secara seragam ke tiap variasi visual (sebagai simplifikasi)
-            # Idealnya, DB menyimpan skor per kombinasi (Topik+Visual), tapi untuk menjaga
-            # skema DB sederhana, kita tambahkan noise/varians agar agen tetap eksplor visual
             for v in range(self.visual_profiles):
                 action_idx = (i * self.visual_profiles) + v
                 self.state[action_idx] = base_score + (0.1 * v)
@@ -93,11 +96,22 @@ class ContentCreatorEnv(gym.Env):
         state = self._update_state()
         return state, {}
 
-    def _save_published_video(self, topic_name: str, video_url: str, platform: str):
+    def _save_published_video(
+        self,
+        topic_name: str,
+        video_url: str,
+        platform: str,
+        platform_video_id: Optional[str] = None,
+    ):
         session = SessionLocal()
         try:
             new_video = PublishedVideo(
-                platform=platform, topic_name=topic_name, video_url=video_url, views=0
+                platform=platform,
+                topic_name=topic_name,
+                video_url=video_url,
+                views=0,
+                performance_status="PENDING",
+                platform_video_id=platform_video_id,
             )
             session.add(new_video)
             session.commit()
@@ -108,13 +122,134 @@ class ContentCreatorEnv(gym.Env):
         finally:
             session.close()
 
+    def _check_last_performance(self) -> dict:
+        """
+        Cek performa video yang dipublish dalam 24-48 jam terakhir.
+        Jika ditemukan video dengan status LOW_VIEWS, aktifkan Self-Correction Mode.
+
+        Returns dict:
+            {
+                "is_aggressive"   : bool  - True jika ada video LOW_VIEWS
+                "failed_topics"   : list  - Topik yang gagal (untuk dihindari/dipenalti)
+                "failed_profiles" : list  - Design profile idx yang gagal
+                "fresh_topic"     : str   - Topik yang paling jarang dipilih (force pick)
+            }
+        """
+        result: dict = {
+            "is_aggressive": False,
+            "failed_topics": [],
+            "failed_profiles": [],
+            "fresh_topic": None,
+        }
+
+        session = SessionLocal()
+        try:
+            # Window evaluasi: video yang sudah lebih dari 24 jam dipublish
+            window_start = datetime.datetime.utcnow() - datetime.timedelta(hours=48)
+            window_end = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+
+            low_videos = (
+                session.query(PublishedVideo)
+                .filter(
+                    PublishedVideo.published_at >= window_start,
+                    PublishedVideo.published_at <= window_end,
+                    PublishedVideo.performance_status == "LOW_VIEWS",
+                )
+                .all()
+            )
+
+            if not low_videos:
+                return result  # Semua baik-baik saja
+
+            result["is_aggressive"] = True
+            logger.warning(
+                f"⚠️  [SELF-CORRECTION] Ditemukan {len(low_videos)} video LOW_VIEWS! "
+                f"Mengaktifkan Aggressive Mode & Pivot..."
+            )
+
+            for v in low_videos:
+                topic_name_str: str = str(v.topic_name)
+                result["failed_topics"].append(topic_name_str)
+                logger.warning(
+                    f"   📉 '{topic_name_str}' | views={v.views} | platform={v.platform}"
+                )
+
+                # Berikan penalti pada topik yang gagal di Redis
+                try:
+                    current = redis_client.get_topic_score(topic_name_str)
+                    old_score: float = current.get("score", 0.0)
+                    times_chosen: int = current.get("times_chosen", 0)
+                    penalized_score = old_score - 5.0
+                    redis_client.set_topic_score(topic_name_str, penalized_score, times_chosen)
+                    logger.warning(
+                        f"   🔴 Penalti score '{topic_name_str}': {old_score:.2f} → {penalized_score:.2f}"
+                    )
+                except Exception as redis_err:
+                    logger.error(f"❌ Gagal update penalti Redis: {redis_err}")
+
+            # Cari topik yang paling jarang dipilih sebagai fresh topic
+            try:
+                all_topics = redis_client.get_all_topics()
+                if all_topics:
+                    unused_topics = [
+                        t for t in all_topics
+                        if t["name"] not in result["failed_topics"]
+                    ]
+                    if unused_topics:
+                        sorted_topics = sorted(
+                            unused_topics, key=lambda t: t.get("times_chosen", 0)
+                        )
+                        result["fresh_topic"] = sorted_topics[0]["name"]
+                        logger.info(
+                            f"✨ [PIVOT] Fresh topic dipilih: '{result['fresh_topic']}' "
+                            f"(times_chosen={sorted_topics[0].get('times_chosen', 0)})"
+                        )
+            except Exception as topic_err:
+                logger.error(f"❌ Gagal cari fresh topic: {topic_err}")
+
+        except Exception as e:
+            logger.error(f"❌ [SELF-CORRECTION] Gagal cek performa DB: {e}")
+        finally:
+            session.close()
+
+        return result
+
     def step(self, action_idx):
         if action_idx >= self.num_actions:
             raise ValueError(f"Action index out of bounds")
 
+        # ======================================================================
+        # SELF-CORRECTION CHECK: Baca performa video 24-48 jam lalu.
+        # Jika ada yang LOW_VIEWS → aktifkan Aggressive Mode & Force Pivot.
+        # ======================================================================
+        perf_check = self._check_last_performance()
+        is_aggressive: bool = perf_check["is_aggressive"]
+        fresh_topic: str = perf_check.get("fresh_topic") or ""
+
+        if is_aggressive:
+            logger.warning(
+                f"🔄 [SELF-CORRECTION] Mode Agresif AKTIF. "
+                f"Force pivot ke topik fresh: '{fresh_topic or 'EKSPLORASI'}'."
+            )
+        # ======================================================================
+
         selected_topic, visual_idx = self._decode_action(action_idx)
         is_explore_action = selected_topic == "EKSPLORASI"
         is_new_topic = False
+
+        # Jika aggressive mode: override topik ke fresh_topic jika topik saat ini adalah low-performer
+        if is_aggressive and fresh_topic and not is_explore_action:
+            if selected_topic in perf_check["failed_topics"]:
+                logger.info(
+                    f"🔄 [PIVOT] Topik '{selected_topic}' adalah low-performer. "
+                    f"Override ke '{fresh_topic}'."
+                )
+                selected_topic = fresh_topic
+
+        # Force pivot design profile: jika aggressive dan visual 0, ganti ke 1 (lebih kontras)
+        if is_aggressive and visual_idx == 0:
+            visual_idx = 1
+            logger.info("🎨 [PIVOT] Design profile di-override: 0 (Kuning-Hitam) → 1 (Putih-Merah)")
 
         if is_explore_action:
             selected_topic = get_trending_topic()
@@ -132,16 +267,13 @@ class ContentCreatorEnv(gym.Env):
                     shape=(self.num_actions,),
                     dtype=np.float32,
                 )
-                # Secara default, eksplorasi menggunakan profil visual 0
                 visual_idx = 0
 
         # --- SPIDER NETWORK COORDINATION ---
-        # Cek apakah topik ini sedang digarap oleh worker lain di cluster
         if redis_client.is_task_active(selected_topic) and not is_explore_action:
             logger.warning(
-                f"🕸️ SPIDER COLLISION: '{selected_topic}' sedang digarap worker lain! Agen mengalah dan memilih topik lain."
+                f"🕸️ SPIDER COLLISION: '{selected_topic}' sedang digarap worker lain! Agen mengalah."
             )
-            # Beri penalti ringan agar agen tidak stuck memilih ini terus di loop saat ini
             redis_client.set_topic_score(selected_topic, -0.5, 0)
             return (
                 self._update_state(),
@@ -151,11 +283,11 @@ class ContentCreatorEnv(gym.Env):
                 {"success": False, "collision": True},
             )
 
-        # Kunci topik ini di Redis
         redis_client.add_active_task(selected_topic)
 
         logger.info(
-            f"🤖 [STEP {self.current_step}] Memproses: '{selected_topic}' | Profil Visual: {visual_idx}"
+            f"🤖 [STEP {self.current_step}] Memproses: '{selected_topic}' | "
+            f"Profil Visual: {visual_idx} | Aggressive: {is_aggressive}"
         )
 
         reward = -2.0
@@ -165,6 +297,7 @@ class ContentCreatorEnv(gym.Env):
             "success": False,
             "url_yt": None,
             "url_ig": None,
+            "is_aggressive": is_aggressive,
         }
 
         try:
@@ -176,28 +309,24 @@ class ContentCreatorEnv(gym.Env):
                 logger.info("🎬 Menggunakan Format 0: Standar Hormozi")
                 video_path = downloader.search_and_download(selected_topic)
                 if video_path:
-                    edit_result = video_editor.process_video(video_path, 0)
+                    edit_result = video_editor.process_video(
+                        video_path, 0, is_aggressive=is_aggressive
+                    )
 
             elif visual_idx == 1:
                 # 1: Clash of Titans
                 logger.info("⚔️ Menggunakan Format 1: Clash of Titans")
-                # Unduh 2 klip dengan pandangan berbeda
                 clip_pro_path = downloader.search_and_download(f"{selected_topic} pro")
-                clip_con_path = downloader.search_and_download(
-                    f"{selected_topic} kontra"
-                )
+                clip_con_path = downloader.search_and_download(f"{selected_topic} kontra")
 
-                # Fallback jika tidak dapat 2 video
                 if not clip_pro_path and clip_con_path:
                     clip_pro_path = downloader.search_and_download(selected_topic)
                 if not clip_con_path and clip_pro_path:
                     clip_con_path = downloader.search_and_download(selected_topic)
 
                 if clip_pro_path and clip_con_path:
-                    edit_result = video_editor.create_clash_format(
-                        clip_pro_path, clip_con_path
-                    )
-                    video_path = [clip_pro_path, clip_con_path]  # Untuk cleanup
+                    edit_result = video_editor.create_clash_format(clip_pro_path, clip_con_path)
+                    video_path = [clip_pro_path, clip_con_path]
                 else:
                     logger.error("❌ Gagal mengunduh bahan untuk Clash of Titans")
                     if clip_pro_path:
@@ -210,65 +339,49 @@ class ContentCreatorEnv(gym.Env):
                 logger.info("❓ Menggunakan Format 2: Quiz Retention Trap")
                 video_path = downloader.search_and_download(selected_topic)
                 if video_path:
-                    # Transkrip sebagian untuk mDeBERTa
-                    import os, uuid
+                    import os as _os
+                    import uuid
                     import moviepy.editor as mp
 
                     try:
                         temp_video = mp.VideoFileClip(video_path)
-                        # Ambil 15 detik pertama untuk analisa
-                        dur = min(15, temp_video.duration)
-                        temp_clip = temp_video.subclip(0, dur)
-                        temp_audio = (
-                            f"data/output/temp_audio_analyze_{uuid.uuid4().hex[:4]}.wav"
-                        )
-                        temp_clip.audio.write_audiofile(
-                            temp_audio,
-                            fps=16000,
-                            nbytes=2,
-                            buffersize=2000,
-                            logger=None,
-                        )
-                        words_data = ai_engine.transcribe_audio(temp_audio)
-                        transcript_text = " ".join([w["word"] for w in words_data])
+                        try:
+                            dur = min(15, temp_video.duration)
+                            temp_clip = temp_video.subclip(0, dur)
+                            temp_audio = f"data/output/temp_audio_analyze_{uuid.uuid4().hex[:4]}.wav"
+                            temp_clip.audio.write_audiofile(
+                                temp_audio, fps=16000, nbytes=2, buffersize=2000, logger=None
+                            )
+                            words_data = ai_engine.transcribe_audio(temp_audio)
+                            transcript_text = " ".join([w["word"] for w in words_data])
+                            if _os.path.exists(temp_audio):
+                                _os.remove(temp_audio)
+                        finally:
+                            logger.info("Closing temp_video")
+                            temp_video.close()
 
-                        if os.path.exists(temp_audio):
-                            os.remove(temp_audio)
-                        temp_video.close()
-
-                        pertanyaan_kuis = ai_engine.generate_quiz_question(
-                            transcript_text
-                        )
+                        pertanyaan_kuis = ai_engine.generate_quiz_question(transcript_text)
                     except Exception as e:
-                        logger.error(
-                            f"❌ Gagal mengekstrak transkrip untuk pertanyaan kuis: {e}"
+                        logger.error(f"❌ Gagal mengekstrak transkrip untuk kuis: {e}")
+                        pertanyaan_kuis = (
+                            f"Tebak apa rahasia dari {selected_topic}? Waktu kalian 5 detik..."
                         )
-                        pertanyaan_kuis = f"Tebak apa rahasia dari {selected_topic}? Waktu kalian 5 detik..."
 
-                    edit_result = video_editor.create_quiz_format(
-                        pertanyaan_kuis, video_path
-                    )
+                    edit_result = video_editor.create_quiz_format(pertanyaan_kuis, video_path)
 
             if edit_result:
-                description = edit_result.get("transcript", "")
+                description: str = edit_result.get("transcript", "")
                 output_video_path = edit_result.get("output_path")
-                cta_used = edit_result.get("cta_used", "")
+                cta_used: str = edit_result.get("cta_used", "")
 
                 # 1. EVALUASI SENTIMEN IndoBERT (Simulasi UGC Reward)
-                # Kita asumsikan transcript/CTA memancing sentimen audiens.
-                # Jika kalimat memancing debat/reaksi kuat, reward bertambah.
                 sentiment_score = ai_engine.evaluate_sentiment(
                     [cta_used, description[:200]]
                 )
-                # Base reward + Sentiment Evaluation (-1.5 s/d +2.0)
                 reward = 1.0 + sentiment_score
-                logger.info(
-                    f"📊 Evaluasi Sentimen UGC selesai. Reward Akhir: {reward:.2f}"
-                )
+                logger.info(f"📊 Evaluasi Sentimen UGC selesai. Reward Akhir: {reward:.2f}")
 
-                knowledge_base.extract_and_save(
-                    selected_topic, edit_result, reward=reward
-                )
+                knowledge_base.extract_and_save(selected_topic, edit_result, reward=reward)
 
                 title = f"{selected_topic.capitalize()} | Opini UGC Viral"
                 tags = [
@@ -277,34 +390,71 @@ class ContentCreatorEnv(gym.Env):
                     "Viral",
                     "Opini",
                     "Indonesia",
+                    "Trending",
+                    "Shorts",
+                    "Reels",
+                    "TikTok",
+                    "hot",
+                    "sensasi",
                 ]
 
                 # 2. DISTRIBUSI: YouTube & Instagram
-                # Generate komentar provokatif via LangChain
+                # Generate komentar provokatif — mode agresif jika dipicu Self-Correction
                 provocative_comment = generate_provocative_comment(
-                    description, selected_topic
+                    description, selected_topic, is_aggressive=is_aggressive
                 )
 
                 yt_url = youtube_uploader.upload_to_youtube_shorts(
-                    output_video_path,
+                    str(output_video_path),
                     title,
                     description,
                     tags,
                     comment_text=provocative_comment,
                 )
                 if yt_url:
+                    # Ekstrak YouTube video ID untuk analytics_tracker
+                    yt_video_id: Optional[str] = None
+                    if "/shorts/" in yt_url:
+                        yt_video_id = yt_url.split("/shorts/")[-1].split("?")[0].strip()
+
                     info["url_yt"] = yt_url
-                    self._save_published_video(selected_topic, yt_url, "youtube")
+                    self._save_published_video(
+                        selected_topic, yt_url, "youtube",
+                        platform_video_id=yt_video_id,
+                    )
+
+                    # Backup video sukses ke data/ytUpload
+                    if output_video_path:
+                        import shutil
+                        import os as _os2
+
+                        yt_upload_dir = "data/ytUpload"
+                        _os2.makedirs(yt_upload_dir, exist_ok=True)
+                        try:
+                            new_path = _os2.path.join(
+                                yt_upload_dir, _os2.path.basename(str(output_video_path))
+                            )
+                            shutil.copy(str(output_video_path), new_path)
+                            logger.info(f"📂 Video sukses YT disimpan ke: {new_path}")
+                        except Exception as copy_err:
+                            logger.error(f"❌ Gagal backup video ke ytUpload: {copy_err}")
                 else:
                     reward -= 1.0  # Penalti karena gagal YT
 
                 ig_caption = f"{title}\n\n{cta_used}\n\n#reelsindonesia #viral"
-                ig_url = ig_uploader.upload_to_reels(output_video_path, ig_caption)
+                ig_url = ig_uploader.upload_to_reels(str(output_video_path), ig_caption)
                 if ig_url:
+                    # Ekstrak IG media code untuk analytics_tracker
+                    ig_media_code: Optional[str] = None
+                    if "/reel/" in ig_url:
+                        ig_media_code = ig_url.split("/reel/")[-1].strip("/").split("/")[0]
+
                     info["url_ig"] = ig_url
-                    self._save_published_video(selected_topic, ig_url, "instagram")
-                else:
-                    pass  # IG sering strict, jangan hukum agen terlalu berat
+                    self._save_published_video(
+                        selected_topic, ig_url, "instagram",
+                        platform_video_id=ig_media_code,
+                    )
+                # IG sering strict, tidak beri penalti berat jika gagal
 
                 if yt_url or ig_url:
                     info["success"] = True
@@ -324,7 +474,7 @@ class ContentCreatorEnv(gym.Env):
             # Lepaskan kunci Spider Network
             redis_client.remove_active_task(selected_topic)
 
-        # Update Skor Topik
+        # Update Skor Topik di Redis
         if is_new_topic:
             old_score = 15.0
             times_chosen = 1

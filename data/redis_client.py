@@ -1,10 +1,14 @@
 import redis
 import json
+import os
+from dotenv import load_dotenv
 from logger import logger
 
 from data.database import SessionLocal
 from data.models import TopicMemory
 import time
+
+load_dotenv()
 
 
 class RedisManager:
@@ -22,8 +26,10 @@ class RedisManager:
         try:
             # Mencoba connect Redis lokal tanpa password
             self._client = redis.Redis(
-                host="localhost",
-                port=6379,
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", 6379)),
+                username=os.getenv("REDIS_USERNAME"),
+                password=os.getenv("REDIS_PASSWORD"),
                 db=0,
                 decode_responses=True,
                 socket_timeout=2,
@@ -32,7 +38,7 @@ class RedisManager:
             self._client.ping()
             self._use_redis = True
             logger.info("🟢 Redis terhubung! Memori cache aktif.")
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
             self._use_redis = False
             logger.warning(
                 "🔴 Redis tidak ditemukan/mati. Fallback otomatis menggunakan SQLite!"
@@ -103,6 +109,34 @@ class RedisManager:
             return {"score": 0.0, "times_chosen": 0}
         finally:
             session.close()
+
+    def is_task_active(self, topic_name: str) -> bool:
+        """Mengecek apakah topik sedang diproses (terkunci) oleh worker lain"""
+        if self._use_redis and self._client:
+            try:
+                return bool(self._client.exists(f"active_task:{topic_name}"))
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal mengecek status tugas di Redis: {e}")
+        return False
+
+    def add_active_task(self, topic_name: str, expiry_seconds: int = 3600):
+        """Menambahkan topik ke daftar tugas aktif (dikunci) dengan waktu kadaluarsa"""
+        if self._use_redis and self._client:
+            try:
+                # Kunci maksimal (misal 1 jam) agar tidak menyangkut jika worker terputus/crash
+                self._client.setex(
+                    f"active_task:{topic_name}", expiry_seconds, "locked"
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal menambahkan kunci tugas di Redis: {e}")
+
+    def remove_active_task(self, topic_name: str):
+        """Menghapus topik dari daftar tugas aktif (membuka kunci)"""
+        if self._use_redis and self._client:
+            try:
+                self._client.delete(f"active_task:{topic_name}")
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal menghapus kunci tugas di Redis: {e}")
 
     def get_all_topics(self):
         """Mendapatkan semua topik dari SQLite untuk Leaderboard"""
