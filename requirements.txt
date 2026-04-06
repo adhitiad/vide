@@ -21,21 +21,23 @@ uvicorn
 jinja2
 websockets
 requests
+aiohttp
 
-# Database & Cache
+# Database & Task Queue (NEW)
 redis
+celery
 
-# Scheduling & Utilities
-apscheduler
-
-# Uploaders (YouTube, Instagram, TikTok)
+# Automation & Notification (NEW)
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
-instagrapi
-playwright
+httpx
+
+# LangChain
 langchain
 langchain-groq
 langchain-core
+
+# Utilities
 python-dotenv
 pytz

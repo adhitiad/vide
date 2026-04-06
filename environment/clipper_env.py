@@ -10,8 +10,6 @@ from core.downloader import downloader
 from core.editor import video_editor
 from core.knowledge import knowledge_base
 from core.researcher import get_trending_topic
-from core.uploader_yt import youtube_uploader
-from core.uploader_ig import ig_uploader
 from core.comment_generator import generate_provocative_comment
 from core.ai_models import ai_engine
 from typing import Optional
@@ -389,19 +387,11 @@ class ContentCreatorEnv(gym.Env):
                     "sensasi",
                 ]
 
-                # 2. SISTEM DISTRIBUSI ANTREAN (STAGGERED UPLOAD)
-                from data.models import UploadQueue
+                # 2. SISTEM DISTRIBUSI VIA GOOGLE DRIVE & CELERY
                 try:
-                    now_utc = datetime.datetime.utcnow()
-                    
-                    platforms = [
-                        ("youtube", 0),
-                        ("instagram", 30),
-                        ("facebook", 60),
-                        ("tiktok", 120)
-                    ]
+                    platforms = ["youtube", "instagram", "facebook", "tiktok"]
 
-                    for plat, delay in platforms:
+                    for plat in platforms:
                         desc = description
                         if plat == "instagram":
                             desc = f"{title}\n\n{cta_used}\n\n#reelsindonesia #viral"
@@ -409,23 +399,29 @@ class ContentCreatorEnv(gym.Env):
                             desc = f"{title}\n\n{cta_used}"
                         elif plat == "tiktok":
                             desc = f"{title} 🔥 #fyp #indonesia #viral"
+                            
+                        # Generate _meta.txt content
+                        meta_content = f"Title: {title}\n\nDescription:\n{desc}\n\nHashtags:\n{','.join(tags)}\n\nProvocative Comment To Pin:\n{cta_used}"
+                        meta_text_path = f"{output_video_path}_{plat}_meta.txt"
+                        
+                        with open(meta_text_path, "w", encoding="utf-8") as fm:
+                            fm.write(meta_content)
 
-                        q_item = UploadQueue(
-                            platform=plat,
+                        # Trigger Celery Task asynchronously
+                        distribute_and_notify.delay(
                             video_path=str(output_video_path),
+                            meta_text_path=meta_text_path,
                             title=title,
-                            description=desc,
+                            comment=cta_used,
                             tags=",".join(tags),
-                            topic_name=selected_topic,
-                            scheduled_at=now_utc + datetime.timedelta(minutes=delay)
+                            platform=plat
                         )
-                        db.upload_queue.insert_one(q_item.to_dict())
 
-                    logger.info("📋 4 Tugas Upload (YT, IG, FB, TT) telah masuk antrean (Staggered/MongoDB).")
+                    logger.info("📋 4 Tugas Upload GDrive (YT, IG, FB, TT) telah di-distribute ke Celery.")
                     info["success"] = True
                 except Exception as qe:
-                    logger.error(f"❌ Gagal antrekan upload: {qe}")
-                # Sistem antrean berhasil dijadwalkan
+                    logger.error(f"❌ Gagal distribute ke Celery Task: {qe}")
+                # Distribusi gdrive dan notifikasi telegram telah dijadwalkan secara logis
                 pass
 
             if video_path:
