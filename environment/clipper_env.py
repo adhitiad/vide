@@ -2,6 +2,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import datetime
+import os
 from logger import logger
 from data.redis_client import redis_client
 from data.mongodb_client import db
@@ -29,8 +30,9 @@ class ContentCreatorEnv(gym.Env):
 
     metadata = {"render_modes": ["console"]}
 
-    def __init__(self):
+    def __init__(self, owner_username: str):
         super(ContentCreatorEnv, self).__init__()
+        self.owner_username = owner_username
 
         # 1. Action Space
         self.topics = self._get_active_topics()
@@ -54,6 +56,8 @@ class ContentCreatorEnv(gym.Env):
         )
 
     def _get_active_topics(self):
+        # Dalam SaaS, topik bisa difilter per user jika perlu, 
+        # namun untuk sekarang kita gunakan global trending + user niche
         topics_data = redis_client.get_all_topics()
         return [t["name"] for t in topics_data] if topics_data else []
 
@@ -65,6 +69,8 @@ class ContentCreatorEnv(gym.Env):
         topic_idx = action_idx // self.visual_profiles
         visual_idx = action_idx % self.visual_profiles
         return self.topics[topic_idx], visual_idx
+
+        return self.state
 
     def _update_state(self):
         self.state = np.zeros(self.num_actions)
@@ -79,6 +85,9 @@ class ContentCreatorEnv(gym.Env):
 
         self.state[-1] = 0.0  # Skor Eksplorasi Riset
         return self.state
+
+    def _get_obs(self):
+        return self._update_state()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -105,6 +114,7 @@ class ContentCreatorEnv(gym.Env):
             new_video = PublishedVideo(
                 platform=platform,
                 topic_name=topic_name,
+                owner_username=self.owner_username,
                 video_url=video_url,
                 views=0,
                 performance_status="PENDING",
@@ -142,12 +152,15 @@ class ContentCreatorEnv(gym.Env):
             window_end = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
 
             # Query MongoDB: Filter berdasarkan rentang waktu dan status
-            low_videos_data = db.published_videos.find({
-                "published_at": {"$gte": window_start, "$lte": window_end},
-                "performance_status": "LOW_VIEWS"
-            })
-            
-            low_videos = [PublishedVideo.from_dict(v) for v in low_videos_data]
+            low_videos_data = db.published_videos.find(
+                {
+                    "owner_username": self.owner_username,
+                    "published_at": {"$gte": window_start, "$lte": window_end},
+                    "performance_status": "LOW_VIEWS",
+                }
+            )
+
+            low_videos = [PublishedVideo.from_dict(v) for v in low_videos_data if v]
 
             if not low_videos:
                 return result  # Semua baik-baik saja
@@ -159,10 +172,13 @@ class ContentCreatorEnv(gym.Env):
             )
 
             for v in low_videos:
-                topic_name_str: str = str(v.topic_name)
+                if v is None:
+                    continue
+                # Gunakan getattr untuk keamanan ekstra
+                topic_name_str = str(getattr(v, "topic_name", "Unknown"))
                 result["failed_topics"].append(topic_name_str)
                 logger.warning(
-                    f"   📉 '{topic_name_str}' | views={v.views} | platform={v.platform}"
+                    f"   📉 '{topic_name_str}' | views={getattr(v, 'views', 0)} | platform={getattr(v, 'platform', 'N/A')}"
                 )
 
                 # Berikan penalti pada topik yang gagal di Redis
@@ -171,7 +187,9 @@ class ContentCreatorEnv(gym.Env):
                     old_score: float = current.get("score", 0.0)
                     times_chosen: int = current.get("times_chosen", 0)
                     penalized_score = old_score - 5.0
-                    redis_client.set_topic_score(topic_name_str, penalized_score, times_chosen)
+                    redis_client.set_topic_score(
+                        topic_name_str, penalized_score, times_chosen
+                    )
                     logger.warning(
                         f"   🔴 Penalti score '{topic_name_str}': {old_score:.2f} → {penalized_score:.2f}"
                     )
@@ -183,7 +201,8 @@ class ContentCreatorEnv(gym.Env):
                 all_topics = redis_client.get_all_topics()
                 if all_topics:
                     unused_topics = [
-                        t for t in all_topics
+                        t
+                        for t in all_topics
                         if t["name"] not in result["failed_topics"]
                     ]
                     if unused_topics:
@@ -238,7 +257,9 @@ class ContentCreatorEnv(gym.Env):
         # Force pivot design profile: jika aggressive dan visual 0, ganti ke 1 (lebih kontras)
         if is_aggressive and visual_idx == 0:
             visual_idx = 1
-            logger.info("🎨 [PIVOT] Design profile di-override: 0 (Kuning-Hitam) → 1 (Putih-Merah)")
+            logger.info(
+                "🎨 [PIVOT] Design profile di-override: 0 (Kuning-Hitam) → 1 (Putih-Merah)"
+            )
 
         if is_explore_action:
             selected_topic = get_trending_topic()
@@ -306,7 +327,9 @@ class ContentCreatorEnv(gym.Env):
                 # 1: Clash of Titans
                 logger.info("⚔️ Menggunakan Format 1: Clash of Titans")
                 clip_pro_path = downloader.search_and_download(f"{selected_topic} pro")
-                clip_con_path = downloader.search_and_download(f"{selected_topic} kontra")
+                clip_con_path = downloader.search_and_download(
+                    f"{selected_topic} kontra"
+                )
 
                 if not clip_pro_path and clip_con_path:
                     clip_pro_path = downloader.search_and_download(selected_topic)
@@ -314,7 +337,9 @@ class ContentCreatorEnv(gym.Env):
                     clip_con_path = downloader.search_and_download(selected_topic)
 
                 if clip_pro_path and clip_con_path:
-                    edit_result = video_editor.create_clash_format(clip_pro_path, clip_con_path)
+                    edit_result = video_editor.create_clash_format(
+                        clip_pro_path, clip_con_path
+                    )
                     video_path = [clip_pro_path, clip_con_path]
                 else:
                     logger.error("❌ Gagal mengunduh bahan untuk Clash of Titans")
@@ -339,7 +364,11 @@ class ContentCreatorEnv(gym.Env):
                             temp_clip = temp_video.subclip(0, dur)
                             temp_audio = f"data/output/temp_audio_analyze_{uuid.uuid4().hex[:4]}.wav"
                             temp_clip.audio.write_audiofile(
-                                temp_audio, fps=16000, nbytes=2, buffersize=2000, logger=None
+                                temp_audio,
+                                fps=16000,
+                                nbytes=2,
+                                buffersize=2000,
+                                logger=None,
                             )
                             words_data = ai_engine.transcribe_audio(temp_audio)
                             transcript_text = " ".join([w["word"] for w in words_data])
@@ -349,28 +378,103 @@ class ContentCreatorEnv(gym.Env):
                             logger.info("Closing temp_video")
                             temp_video.close()
 
-                        pertanyaan_kuis = ai_engine.generate_quiz_question(transcript_text)
+                        pertanyaan_kuis = ai_engine.generate_quiz_question(
+                            transcript_text
+                        )
                     except Exception as e:
                         logger.error(f"❌ Gagal mengekstrak transkrip untuk kuis: {e}")
-                        pertanyaan_kuis = (
-                            f"Tebak apa rahasia dari {selected_topic}? Waktu kalian 5 detik..."
-                        )
+                        pertanyaan_kuis = f"Tebak apa rahasia dari {selected_topic}? Waktu kalian 5 detik..."
 
-                    edit_result = video_editor.create_quiz_format(pertanyaan_kuis, video_path)
+                    edit_result = video_editor.create_quiz_format(
+                        pertanyaan_kuis, video_path
+                    )
 
             if edit_result:
                 description: str = edit_result.get("transcript", "")
                 output_video_path = edit_result.get("output_path")
                 cta_used: str = edit_result.get("cta_used", "")
 
+                # PANGGIL GROQ UNTUK MENGHASILKAN KOMENTAR PROVOKATIF
+                from core.comment_generator import generate_provocative_comment
+
+                provocative_comment = generate_provocative_comment(
+                    transcript_text=description,
+                    topic=selected_topic,
+                    is_aggressive=is_aggressive,
+                )
+
+                # =========================================================
+                # 🛑 MACHINE LEARNING QUALITY CONTROL (TIER SYSTEM)
+                # =========================================================
+                virality_score = ai_engine.predict_virality_score(
+                    selected_topic, description
+                )
+
+                # Konversi skor probabilitas ke format Persentase (0 - 100%)
+                score_pct = virality_score * 100
+                is_red_list = False # Flag khusus untuk Dashboard
+
+                # Klasifikasi Tier Kualitas Konten
+                if score_pct < 65.0:
+                    kategori_qc = "⚫ DAFTAR HITAM"
+                    logger.warning(
+                        f"🗑️ [ML QC REJECTED] {kategori_qc} - Video '{selected_topic}' "
+                        f"diprediksi GAGAL (Skor: {score_pct:.1f}%)."
+                    )
+
+                    # Simpan hanya judul ke database agar kita punya history kegagalan
+                    db.published_videos.insert_one({
+                        "topic_name": selected_topic,
+                        "platform": "ALL",
+                        "performance_status": "BLACKLISTED",
+                        "score_pct": score_pct,
+                        "created_at": datetime.datetime.utcnow()
+                    })
+
+                    # 1. Hapus file MP4 lokal agar tidak jadi sampah
+                    if os.path.exists(output_video_path):
+                        os.remove(output_video_path)
+
+                    # 2. Hukuman Sangat Berat (-20) ke RL Agent karena membuang resource
+                    reward = -20.0
+
+                    # 3. Hentikan proses, jangan kirim ke Celery
+                    info["success"] = False
+                    info["reason"] = f"ML_QC_BLACKLIST_{score_pct:.1f}"
+                    return self._get_obs(), reward, False, False, info
+
+                elif score_pct <= 75.0:
+                    kategori_qc = "🔴 DAFTAR MERAH"
+                    reward += 1.0  # Reward kecil (Lolos tapi berisiko)
+                    is_red_list = True # Tandai untuk Dashboard
+
+                elif score_pct <= 87.0:
+                    kategori_qc = "🟢 DAFTAR HIJAU MUDA"
+                    reward += 5.0  # Reward sedang (Konten aman & menjanjikan)
+
+                else:
+                    kategori_qc = "🟩 DAFTAR HIJAU TUA"
+                    reward += 15.0  # Jackpot! Reward masif agar RL sering membuat ini
+
+                logger.info(
+                    f"✅ [ML QC PASSED] {kategori_qc} - Video '{selected_topic}' LAYAK UPLOAD! "
+                    f"(Skor: {score_pct:.1f}%)"
+                )
+
+                # Simpan komentar provokatif ini ke dalam dictionary edit_result
+                edit_result["provocative_comment"] = provocative_comment
                 # 1. EVALUASI SENTIMEN IndoBERT (Simulasi UGC Reward)
                 sentiment_score = ai_engine.evaluate_sentiment(
                     [cta_used, description[:200]]
                 )
                 reward = 1.0 + sentiment_score
-                logger.info(f"📊 Evaluasi Sentimen UGC selesai. Reward Akhir: {reward:.2f}")
+                logger.info(
+                    f"📊 Evaluasi Sentimen UGC selesai. Reward Akhir: {reward:.2f}"
+                )
 
-                knowledge_base.extract_and_save(selected_topic, edit_result, reward=reward)
+                knowledge_base.extract_and_save(
+                    selected_topic, edit_result, reward=reward
+                )
 
                 title = f"{selected_topic.capitalize()} | Opini UGC Viral"
                 tags = [
@@ -388,41 +492,74 @@ class ContentCreatorEnv(gym.Env):
                 ]
 
                 # 2. SISTEM DISTRIBUSI VIA GOOGLE DRIVE & CELERY
+                # 2. SISTEM DISTRIBUSI VIA GOOGLE DRIVE & CELERY
                 try:
                     platforms = ["youtube", "instagram", "facebook", "tiktok"]
+                    meta_paths_created = []
 
                     for plat in platforms:
-                        desc = description
+                        desc = ""  # Default
+                        # DYNAMIC ALGORITHM ROUTING
                         if plat == "instagram":
-                            desc = f"{title}\n\n{cta_used}\n\n#reelsindonesia #viral"
+                            # IG: Estetika bersih, fokus pada Hook dan Call to Action (AIDA)
+                            desc = f"{title}\n\n{cta_used}\n\n👇 Baca selengkapnya di kolom komentar.\n\n#reelsindonesia #viral #{selected_topic.replace(' ', '')}"
                         elif plat == "facebook":
-                            desc = f"{title}\n\n{cta_used}"
+                            # FB: Framework PAS (Problem, Agitate, Solve) untuk memicu debat panjang
+                            desc = (
+                                f"Pernah merasa capek dengan masalah {selected_topic}? (Problem)\n"
+                                f"Banyak orang yang nyerah karena ini. (Agitate)\n"
+                                f"Tonton solusinya di video ini sampai habis! (Solve)\n\n"
+                                f"🗣️ {cta_used}"
+                            )
+                        elif plat == "youtube":
+                            # YT Shorts: Kepadatan Keyword / SEO Search
+                            desc = (
+                                f"{title}\n\n"
+                                f"Video ini membahas tuntas tentang {selected_topic}, opini viral, "
+                                f"fakta mengejutkan, dan teknik retensi.\n\n"
+                                f"{cta_used}\n\n"
+                                f"Hashtags: {' '.join(tags)}"
+                            )
                         elif plat == "tiktok":
-                            desc = f"{title} 🔥 #fyp #indonesia #viral"
-                            
-                        # Generate _meta.txt content
-                        meta_content = f"Title: {title}\n\nDescription:\n{desc}\n\nHashtags:\n{','.join(tags)}\n\nProvocative Comment To Pin:\n{cta_used}"
-                        meta_text_path = f"{output_video_path}_{plat}_meta.txt"
+                            # TT: Singkat, padat, maksimalkan hashtag trending
+                            desc = f"{title} 🔥\n\n{cta_used}\n\n#fyp #indonesia #viral #{selected_topic.replace(' ', '')}"
                         
-                        with open(meta_text_path, "w", encoding="utf-8") as fm:
-                            fm.write(meta_content)
+                        # Fallback jika tidak ada yang cocok
+                        if not desc:
+                            desc = f"Video {kategori_qc} - {title}"
 
-                        # Trigger Celery Task asynchronously
-                        distribute_and_notify.delay(
-                            video_path=str(output_video_path),
-                            meta_text_path=meta_text_path,
-                            title=title,
-                            comment=cta_used,
-                            tags=",".join(tags),
-                            platform=plat
+                        # Format akhir _meta.txt untuk disalin manual
+                        # Format akhir _meta.txt untuk disalin manual
+                        meta_content = (
+                            f"=== STRATEGI ALGORITMA: {plat.upper()} ===\n"
+                            f"📊 Prediksi ML: {kategori_qc} ({score_pct:.1f}% Potensi Viral)\n\n"
+                            f"CAPTION & DESKRIPSI (Siap Copas):\n{desc}\n\n"
+                            f"KOMENTAR PERTAMA (Pin Comment):\n{edit_result.get('provocative_comment', cta_used)}\n\n"
                         )
 
-                    logger.info("📋 4 Tugas Upload GDrive (YT, IG, FB, TT) telah di-distribute ke Celery.")
+                        meta_text_path = f"{output_video_path}_{plat}_meta.txt"
+                        with open(meta_text_path, "w", encoding="utf-8") as fm:
+                            fm.write(meta_content)
+                        meta_paths_created.append(meta_text_path)
+
+                    # Trigger Celery (Sesuai perbaikan sebelumnya)
+                    from tasks import distribute_and_notify
+
+                    distribute_and_notify.delay(
+                        video_path=str(output_video_path),
+                        meta_paths=meta_paths_created,
+                        title=title,
+                        comment=cta_used,
+                        platforms=platforms,
+                        is_red_list=is_red_list,
+                        owner_username=self.owner_username,
+                    )
+                    logger.info(
+                        "📋 Tugas Upload Terpusat telah di-distribute ke Celery."
+                    )
                     info["success"] = True
                 except Exception as qe:
                     logger.error(f"❌ Gagal distribute ke Celery Task: {qe}")
-                # Distribusi gdrive dan notifikasi telegram telah dijadwalkan secara logis
-                pass
 
             if video_path:
                 if isinstance(video_path, list):

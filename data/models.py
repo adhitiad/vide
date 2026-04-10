@@ -27,6 +27,7 @@ class PublishedVideo:
         self,
         topic_name: str,
         video_url: str,
+        owner_username: str,
         platform: str = "youtube",
         published_at: datetime.datetime = None,
         platform_video_id: Optional[str] = None,
@@ -40,6 +41,7 @@ class PublishedVideo:
         self._id = _id
         self.topic_name = topic_name
         self.video_url = video_url
+        self.owner_username = owner_username
         self.platform = platform
         self.published_at = published_at or datetime.datetime.utcnow()
         self.platform_video_id = platform_video_id
@@ -64,6 +66,7 @@ class PublishedVideo:
         return {
             "topic_name": self.topic_name,
             "video_url": self.video_url,
+            "owner_username": self.owner_username,
             "platform": self.platform,
             "published_at": self.published_at,
             "platform_video_id": self.platform_video_id,
@@ -80,6 +83,7 @@ class UploadQueue:
         self,
         video_path: str,
         title: str,
+        owner_username: str,
         description: str = "",
         tags: str = "",
         topic_name: Optional[str] = None,
@@ -99,6 +103,7 @@ class UploadQueue:
         self._id = _id
         self.video_path = video_path
         self.title = title
+        self.owner_username = owner_username
         self.description = description
         self.tags = tags
         self.topic_name = topic_name
@@ -123,6 +128,7 @@ class UploadQueue:
         return {
             "video_path": self.video_path,
             "title": self.title,
+            "owner_username": self.owner_username,
             "description": self.description,
             "tags": self.tags,
             "topic_name": self.topic_name,

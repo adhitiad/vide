@@ -1,4 +1,5 @@
 import os
+import asyncio
 import glob
 import random
 
@@ -16,21 +17,36 @@ from moviepy.audio.AudioClip import CompositeAudioClip
 from logger import logger
 import numpy as np
 
+# Integrasi Rust (PyO3) - Opsional
+try:
+    import vide_performa
+    HAS_RUST_PERFORMA = True
+    logger.info("⚡ Modul Performa Rust (PyO3) terdeteksi! Menggunakan akselerasi hardware.")
+except ImportError:
+    HAS_RUST_PERFORMA = False
+    logger.info("ℹ️ Modul Performa Rust tidak ditemukan. Menggunakan mode standar Python.")
+
+from utils.ffmpeg_async import extract_audio_async, run_ffmpeg_async
+
 # Emoji yang disisipkan secara acak pada subtitle mode agresif
 _AGGRESSIVE_EMOJIS = ["⚠️", "🔥", "💀", "😤", "❗"]
 
 # Global placeholder for MediaPipe solution
 mp_face_detection = None
+HAS_MEDIAPIPE = False
 
 try:
-    import mediapipe as mp_face
-
-    # Cek apakah modul solutions tersedia (seringkali bermasalah di Python 3.13)
-    if hasattr(mp_face, "solutions"):
-        from mediapipe.python.solutions import face_detection as mp_face_detection
-        HAS_MEDIAPIPE = True
-    else:
-        HAS_MEDIAPIPE = False
+    import mediapipe as mp_base
+    if hasattr(mp_base, "solutions"):
+        # Coba import secara langsung untuk mendukung linter dan runtime
+        try:
+            from mediapipe.solutions import face_detection
+            mp_face_detection = face_detection
+        except (ImportError, AttributeError):
+            from mediapipe.python.solutions import face_detection as mp_face_detection
+            
+        if mp_face_detection is not None:
+            HAS_MEDIAPIPE = True
 except (ImportError, AttributeError, ModuleNotFoundError, Exception):
     HAS_MEDIAPIPE = False
 
@@ -82,6 +98,9 @@ class VideoEditor:
             small_w, small_h = 320, int(h * (320 / w))
 
             # Inisialisasi FaceDetection sekali di luar loop frame untuk performa
+            if mp_face_detection is None:
+                raise ImportError("MediaPipe face_detection module is None")
+                
             face_detection = mp_face_detection.FaceDetection(
                 model_selection=1, min_detection_confidence=0.5
             )
@@ -91,6 +110,10 @@ class VideoEditor:
 
             def crop_frame(get_frame, t):
                 frame = get_frame(t)
+
+                # Batasi x_center agar tidak crop ke luar batas
+                target_ratio = target_w / target_h
+                crop_w = int(h * target_ratio)
 
                 # Default (Tengah)
                 x_center = w // 2
@@ -108,14 +131,23 @@ class VideoEditor:
                         # Ambil wajah pertama
                         bbox = results.detections[0].location_data.relative_bounding_box
                         x_center_rel = bbox.xmin + (bbox.width / 2)
-                        track_state["x"] = int(x_center_rel * w)
+                        
+                        # GUNAKAN RUST JIKA TERSEDIA untuk kalkulasi koordinat presisi
+                        if HAS_RUST_PERFORMA:
+                            try:
+                                # Simulasi pemanggilan Rust (vide_performa mengembalikan koordinat mentah)
+                                import json
+                                res_json = vide_performa.calculate_crop_windows(
+                                    w, h, target_w, target_h, [(t, x_center_rel)]
+                                )
+                                windows = json.loads(res_json)
+                                track_state["x"] = windows[0]["x1"] + (crop_w // 2) if windows else int(x_center_rel * h)
+                            except Exception:
+                                track_state["x"] = int(x_center_rel * w)
+                        else:
+                            track_state["x"] = int(x_center_rel * w)
+                            
                     track_state["time"] = t
-
-                x_center = track_state["x"]
-
-                # Batasi x_center agar tidak crop ke luar batas
-                target_ratio = target_w / target_h
-                crop_w = int(h * target_ratio)
 
                 x1 = max(0, x_center - crop_w // 2)
                 x2 = min(w, x1 + crop_w)
@@ -156,16 +188,21 @@ class VideoEditor:
             )
             return self._fallback_center_crop(video_clip, target_w, target_h)
 
-    def _fallback_center_crop(self, video_clip: mp.VideoFileClip, target_w=720, target_h=1280):
+    def _fallback_center_crop(
+        self, video_clip: mp.VideoFileClip, target_w=720, target_h=1280
+    ):
         w, h = video_clip.size
         target_ratio = target_w / target_h
         crop_w = int(h * target_ratio)
         x_center = w / 2
         x1 = max(0, x_center - crop_w / 2)
         x2 = min(w, x1 + crop_w)
-        return video_clip.crop(x1=x1, y1=0, x2=x2, y2=h).resize(
-            newsize=(target_w, target_h)
-        )
+        # Gunakan vfx.crop jika tersedia, jika tidak fallback ke method .crop()
+        try:
+            return video_clip.fx(vfx.crop, x1=x1, y1=0, x2=x2, y2=h).fx(mp_resize, newsize=(target_w, target_h))
+        except Exception:
+            # Fallback untuk versi MoviePy lama atau jika fx gagal
+            return video_clip.crop(x1=x1, y1=0, x2=x2, y2=h).resize(newsize=(target_w, target_h))
 
     def _create_hormozi_subtitle(
         self, word_data, video_width, video_height, profile, is_aggressive: bool = False
@@ -461,7 +498,7 @@ class VideoEditor:
             }
         except Exception as e:
             logger.error(f"❌ Kesalahan pada create_clash_format: {e}")
-            return None
+            return {"error": str(e)}
 
     def create_quiz_format(self, pertanyaan_kuis: str, video_utama_path: str) -> dict:
         """Membuat Retention Trap (Quiz Format)"""
@@ -565,7 +602,7 @@ class VideoEditor:
 
         except Exception as e:
             logger.error(f"❌ Kesalahan pada create_quiz_format: {e}")
-            return None
+            return {"error": str(e)}
 
     def process_video(
         self,
@@ -583,17 +620,11 @@ class VideoEditor:
                                    - Emoji ⚠️/🔥 disisipkan acak di subtitle
                                    - Design profile di-swap ke profile paling berbeda
         """
-        logger.info(f"🎬 Memulai produksi {'🔥 AGGRESSIVE' if is_aggressive else 'Studio-Grade'}: {input_path}")
+        logger.info(
+            f"🎬 Memulai produksi {'🔥 AGGRESSIVE' if is_aggressive else 'Studio-Grade'}: {input_path}"
+        )
 
-        # Mode Agresif: paksa ganti design profile ke yang paling kontras
-        if is_aggressive:
-            # Rotasi ke profile berikutnya agar berbeda dari yang sebelumnya gagal
-            design_profile_idx = (design_profile_idx + 1) % len(self.design_profiles)
-            logger.info(
-                f"🔄 [AGGRESSIVE] Design profile di-pivot ke idx={design_profile_idx} "
-                f"({self.design_profiles[design_profile_idx]['name']})"
-            )
-
+        # Profiling design
         profile = self.design_profiles[design_profile_idx % len(self.design_profiles)]
         logger.info(f"🎨 Visual Profile: {profile['name']}")
 
@@ -615,11 +646,23 @@ class VideoEditor:
             # 2. Face-Tracking Autocrop
             video = self._autocrop_face_tracking(video, target_w, target_h)
 
-            # 3. Transkripsi dengan Whisper
+            # 3. Transkripsi dengan Whisper (Gunakan Async FFmpeg untuk ekstraksi audio)
             temp_audio_path = f"temp_audio_{uuid.uuid4().hex[:4]}.wav"
-            video.audio.write_audiofile(
-                temp_audio_path, fps=16000, nbytes=2, buffersize=2000, logger=None
-            )
+            
+            # Optimalisasi Asynchronous: Ganti video.audio.write_audiofile yang blocking
+            logger.info("⚡ Mengekstrak audio secara asynchronous...")
+            # Kita panggil loop async dalam thread sinkron ini (worker thread)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            success = loop.run_until_complete(extract_audio_async(input_path, temp_audio_path))
+            loop.close()
+
+            if not success:
+                logger.error("❌ Gagal mengekstrak audio via Async FFmpeg, fallback ke sync.")
+                video.audio.write_audiofile(
+                    temp_audio_path, fps=16000, nbytes=2, buffersize=2000, logger=None
+                )
+
             words_data = ai_engine.transcribe_audio(temp_audio_path)
             full_text = " ".join([w["word"] for w in words_data])
 
@@ -645,10 +688,15 @@ class VideoEditor:
                     # Efek psikologis: kecepatan lebih tinggi = persepsi urgensi dan energi
                     if is_aggressive:
                         try:
-                            hook_clip = hook_clip.fx(afx.audio_speedx, 1.1)
-                            logger.info("⚡ [AGGRESSIVE] Audio hook di-speed-up 1.1x untuk efek urgensi.")
+                            # Gunakan speedx (bukan audio_speedx) untuk moviepy audio fx
+                            hook_clip = hook_clip.fx(afx.speedx, 1.1)
+                            logger.info(
+                                "⚡ [AGGRESSIVE] Audio hook di-speed-up 1.1x untuk efek urgensi."
+                            )
                         except Exception as spd_err:
-                            logger.warning(f"⚠️ Gagal speed-up audio, pakai kecepatan normal: {spd_err}")
+                            logger.warning(
+                                f"⚠️ Gagal speed-up audio, pakai kecepatan normal: {spd_err}"
+                            )
                     # ─────────────────────────────────────────────────────────────────────
 
                     hook_dur = hook_clip.duration
@@ -717,7 +765,7 @@ class VideoEditor:
 
         except Exception as e:
             logger.error(f"❌ Kesalahan Studio Editing: {e}")
-            return None
+            return {"error": str(e)}
 
 
 video_editor = VideoEditor()

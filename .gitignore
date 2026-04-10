@@ -55,3 +55,17 @@ data/tt_session/
 data/fb_session/
 temp_audio_analyze_*.wav
 token.pickle
+
+# ---- NodeJS / Bun (ts_engine) ----
+node_modules/
+ts_engine/node_modules/
+out/
+dist/
+*.tgz
+coverage/
+*.lcov
+.env.local
+.env.*.local
+.eslintcache
+.cache
+*.tsbuildinfo

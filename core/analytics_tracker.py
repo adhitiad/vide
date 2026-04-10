@@ -181,18 +181,12 @@ def update_youtube_stats() -> dict:
             video_ids_str = ",".join(id_to_video.keys())
 
             # Satu API call untuk seluruh batch (hemat quota)
-            try:
-                response = (
-                    youtube.videos().list(part="statistics", id=video_ids_str).execute()
-                )
-            except Exception as api_err:
-                logger.error(
-                    f"❌ [Analytics YT] YouTube API error saat batch request: {api_err}\n"
-                    f"   💡 Kemungkinan quota habis. Akan dicoba lagi besok."
-                )
-                summary["failed"] += len(id_to_video)
-                continue
 
+            response = (
+                youtube.videos()
+                .list(part="statistics", id=video_ids_str)
+                .execute()
+            )
             items = response.get("items", [])
             returned_ids = {item["id"] for item in items}
 
@@ -231,7 +225,8 @@ def update_youtube_stats() -> dict:
                         summary["low_views"] += 1
                     elif new_status == "VIRAL":
                         summary["viral"] += 1
-                        _boost_viral_topic(video.topic_name)
+                        if video and video.topic_name:
+                            _boost_viral_topic(video.topic_name)
                     elif new_status == "GOOD":
                         summary["good"] += 1
 
@@ -341,11 +336,13 @@ def update_instagram_stats() -> dict:
                 )
 
                 summary["updated"] += 1
+                new_status = _evaluate_and_update_status(video)
                 if new_status == "LOW_VIEWS":
                     summary["low_views"] += 1
                 elif new_status == "VIRAL":
                     summary["viral"] += 1
-                    _boost_viral_topic(video.topic_name)
+                    if video and video.topic_name:
+                        _boost_viral_topic(video.topic_name)
                 elif new_status == "GOOD":
                     summary["good"] += 1
 

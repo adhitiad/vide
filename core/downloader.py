@@ -1,4 +1,5 @@
 import yt_dlp
+import asyncio
 import os
 import uuid
 import glob
@@ -178,5 +179,10 @@ class VideoDownloader:
                 else:
                     logger.error(f"❌ Gagal menghapus {filepath} setelah {max_retries} kali percobaan: {e}")
 
+
+    async def search_and_download_async(self, topic: str, max_duration: int = 1200):
+        """Versi asinkron dari pencarian dan pengunduhan"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.search_and_download, topic, max_duration)
 
 downloader = VideoDownloader()

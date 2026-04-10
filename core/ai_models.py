@@ -11,7 +11,7 @@ try:
 
     _ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     _ffmpeg_dir = os.path.dirname(_ffmpeg_exe)
-    
+
     # Whisper secara hardcode memanggil perintah "ffmpeg"
     # Di Windows, exe bawaan imageio_ffmpeg bernama "ffmpeg-win64-..."
     # Kita harus buat alias (copy) dengan nama "ffmpeg.exe"
@@ -21,7 +21,7 @@ try:
             shutil.copyfile(_ffmpeg_exe, _ffmpeg_alias)
         except Exception as copy_err:
             logger.warning(f"⚠️ Gagal membuat alias ffmpeg.exe: {copy_err}")
-    
+
     if _ffmpeg_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
     logger.info("🛠️ FFmpeg terdeteksi dan diinjeksi ke PATH: %s", _ffmpeg_exe)
@@ -35,46 +35,86 @@ from typing import Any, Dict, cast, List
 class AIEngine:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"🔄 Menginisialisasi model AI pada device: {self.device}")
+        logger.info(
+            f"🔄 AIEngine Standby. Device: {self.device} (Model akan di-load saat dibutuhkan)"
+        )
 
-        # Inisialisasi Whisper
-        try:
-            self.whisper_model = whisper.load_model("base", device=self.device)
-            logger.info("✅ Whisper (base) berhasil dimuat.")
-        except Exception as e:
-            logger.error(f"❌ Gagal memuat Whisper: {e}")
-            self.whisper_model = None
+        # Jangan load model di sini! Berikan nilai None
+        self._whisper_model = None
+        self._mdeberta_pipeline = None
+        self._indobert_pipeline = None
 
-        # Inisialisasi mDeBERTa untuk zero-shot classification (Smart CTA)
-        try:
-            # Gunakan penugasan tipe Any untuk mematikan validasi overload Pyright yang membingungkan
-            pipeline_func: Any = pipeline
-            self.mdeberta_pipeline = pipeline_func(
+    @property
+    def whisper_model(self):
+        """Lazy Load Whisper"""
+        if self._whisper_model is None:
+            logger.info("⏳ Memuat Whisper model ke RAM...")
+            self._whisper_model = whisper.load_model("base", device=self.device)
+        return self._whisper_model
+
+    @property
+    def mdeberta_pipeline(self):
+        """Lazy Load mDeBERTa"""
+        if self._mdeberta_pipeline is None:
+            logger.info("⏳ Memuat mDeBERTa model ke RAM...")
+            self._mdeberta_pipeline = pipeline(
                 task="zero-shot-classification",
                 model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
                 token=os.getenv("HF_TOKEN"),
                 device=0 if self.device == "cuda" else -1,
             )
-            logger.info("✅ mDeBERTa (MoritzLaurer) berhasil dimuat.")
-        except Exception as e:
-            logger.error("❌ Gagal memuat mDeBERTa: %s", e)
-            self.mdeberta_pipeline = None
+        return self._mdeberta_pipeline
 
-        # Inisialisasi IndoBERT untuk sentimen evaluasi (Simulasi Reward UGC)
-        try:
-            pipeline_func: Any = pipeline
-            self.indobert_pipeline = pipeline_func(
+    @property
+    def indobert_pipeline(self):
+        """Lazy Load IndoBERT"""
+        if self._indobert_pipeline is None:
+            logger.info("⏳ Memuat IndoBERT model ke RAM...")
+            self._indobert_pipeline = pipeline(
                 task="sentiment-analysis",
                 model="mdhugol/indonesia-bert-sentiment-classification",
                 token=os.getenv("HF_TOKEN"),
                 device=0 if self.device == "cuda" else -1,
             )
+        return self._indobert_pipeline
+
+    def predict_virality_score(self, topic: str, transcript_text: str) -> float:
+        """
+        Gatekeeper ML: Memprediksi seberapa besar peluang video ini sukses (Viral/Good).
+        Menggunakan Fine-Tuned IndoBERT. Return berupa probabilitas 0.0 - 1.0.
+        """
+        if not self.indobert_pipeline:
+            logger.warning("⚠️ IndoBERT tidak tersedia, QC dilompati (otomatis lolos).")
+            return 1.0  # Lolos otomatis jika model gagal dimuat
+
+        try:
+            # Format input harus sama dengan format saat training di Colab
+            # text = "Topik - Transkrip"
+            text_to_analyze = f"{topic} - {transcript_text[:1000]}"
+
+            # Pipeline sentiment-analysis mengembalikan label dan score
+            predictor = self.indobert_pipeline
+            result = predictor(text_to_analyze)[0]
+            label = result["label"].lower()
+            score = result["score"]
+
+            # Asumsi output pipeline: LABEL_1 (Viral/Good), LABEL_0 (Low Views)
+            # Jika menggunakan pipeline default HF, sesuaikan pembacaan labelnya
+            if "1" in label or "positive" in label:
+                probabilitas_viral = score
+            else:
+                probabilitas_viral = (
+                    1.0 - score
+                )  # Jika model sangat yakin ini jelek (LABEL_0 = 0.9), probabilitas viral = 0.1
+
             logger.info(
-                "✅ IndoBERT (indobenchmark) berhasil dimuat untuk Analisis Sentimen."
+                f"🧠 ML QC memprediksi Probabilitas Sukses: {probabilitas_viral * 100:.1f}%"
             )
+            return probabilitas_viral
+
         except Exception as e:
-            logger.error("❌ Gagal memuat IndoBERT: %s", e)
-            self.indobert_pipeline = None
+            logger.error(f"❌ Gagal memprediksi skor viralitas: {e}")
+            return 1.0  # Fail-safe: lolos jika error
 
     def transcribe_audio(self, audio_path: str):
         if not self.whisper_model:
@@ -86,19 +126,21 @@ class AIEngine:
             # Pastikan FFmpeg dalam PATH sesaat sebelum transkripsi (Windows Fix)
             import imageio_ffmpeg
             import shutil
-            
+
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             ffmpeg_dir = os.path.dirname(ffmpeg_exe)
-            
+
             ffmpeg_alias = os.path.join(ffmpeg_dir, "ffmpeg.exe")
             if not os.path.exists(ffmpeg_alias) and ffmpeg_exe != ffmpeg_alias:
                 try:
                     shutil.copyfile(ffmpeg_exe, ffmpeg_alias)
                 except Exception:
                     pass
-            
+
             if ffmpeg_dir not in os.environ.get("PATH", ""):
-                os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+                os.environ["PATH"] = (
+                    ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+                )
 
             # Whisper memanggil ffmpeg via subprocess
             try:
@@ -157,12 +199,13 @@ class AIEngine:
             result = self.mdeberta_pipeline(text_to_analyze, candidate_labels)
             top_label = result["labels"][0]
 
+            # [REVISI UNTUK ALGORITMA INSTAGRAM 2025]
             cta_mapping = {
-                "bertanya pendapat": "Gimana pendapatmu? Setuju nggak? Komen!",
-                "mengundang debat": "Coba bantah ini di kolom komentar!",
-                "meminta saran": "Punya tips lain? Share di komentar!",
-                "berbagi pengalaman": "Pernah ngalamin ini? Ceritain dong!",
-                "menyatakan fakta mengejutkan": "Mindblowing kan? Komen reaksi kalian!",
+                "bertanya pendapat": "Komen pendapat kalian & FOLLOW untuk diskusi panas lainnya!",
+                "mengundang debat": "Berani bantah? Komen di bawah & SUBSCRIBE buat bukti selanjutnya!",
+                "meminta saran": "Punya tips lain? Drop di komen & FOLLOW biar nggak kudet!",
+                "berbagi pengalaman": "Pernah ngalamin? Ceritain di komen & SUBSCRIBE buat konten relate lainnya!",
+                "menyatakan fakta mengejutkan": "Mindblowing? FOLLOW sekarang karena besok gue bongkar fakta yang lebih gila!",
             }
 
             cta_text = cta_mapping.get(

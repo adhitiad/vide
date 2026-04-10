@@ -41,3 +41,13 @@ langchain-core
 # Utilities
 python-dotenv
 pytz
+
+# Security & SaaS Features
+PyJWT==2.8.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+user-agents==2.2.0
+slowapi==0.1.9
+feedparser==6.0.11
+psutil==5.9.8
+GPUtil==1.4.0
